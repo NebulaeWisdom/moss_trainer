@@ -12,3 +12,6 @@ tqdm
 openai>=1.66.3
 Pillow>=11.0.0
 PyYAML>=6.0.2
+# training.compile_pointwise（configs/moss_official.json 默认开启）需要 Triton。
+triton>=3.8; sys_platform != "win32"
+triton-windows>=3.8.0.post28; sys_platform == "win32"

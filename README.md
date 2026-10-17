@@ -16,7 +16,7 @@ git clone https://github.com/KohakuBlueleaf/LyCORIS
 pip install ./LyCORIS
 ```
 
-官方预设默认开启 `training.compile_pointwise`，需要额外安装 Triton（Windows：`pip install triton-windows`，实测 `3.8.0.post28`）与暴露 `emulate_precision_casts` 的 PyTorch（实测 `2.14.0+cu130`）；缺任一项启动即显式报错。不想装就把配置里的 `compile_pointwise` 设为 `false`，cuDNN 收益仍在（见「训练性能」）。
+官方预设默认开启 `training.compile_pointwise`：Triton 已由上面的 `requirements.txt` 按平台安装（Linux `triton`，Windows `triton-windows`，实测 `3.8.0.post28`），另需 PyTorch 暴露 Inductor 的 `emulate_precision_casts`（实测 `2.14.0+cu130`）；缺任一项启动即显式报错。PyTorch 版本不满足时，把配置里的 `compile_pointwise` 设为 `false`，cuDNN 收益仍在（见「训练性能」）。
 
 ## 模型
 

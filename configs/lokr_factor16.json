@@ -1,0 +1,92 @@
+{
+  "model_dir": "G:/ComfyUI/models/moss_image_sft_bf16",
+  "dataset": {
+    "image_dir": "G:/github_repo/moss_image_trainer/test_image",
+    "caption": null,
+    "caption_extension": ".json",
+    "caption_format": "moss_official",
+    "caption_dir": "G:/github_repo/moss_image_trainer/test_image_caption",
+    "caption_weights": {
+      "long": 1,
+      "medium": 1,
+      "short": 1
+    },
+    "resolutions": [
+      1024
+    ],
+    "bucket_step": 16,
+    "max_aspect_ratio": 2.0,
+    "random_crop": true,
+    "bucket_mode": "resize",
+    "repeats": 1,
+    "caption_dropout": 0.0,
+    "seed": 42
+  },
+  "text": {
+    "max_sequence_length": 4096,
+    "gpu_memory_gib": 10,
+    "cpu_memory_gib": 48
+  },
+  "adapter": {
+    "algo": "lokr",
+    "rank": 4,
+    "alpha": 4,
+    "target_modules": [
+      "_Block"
+    ],
+    "dropout": 0.0,
+    "kwargs": {
+      "use_scalar": true,
+      "factor": 16
+    }
+  },
+  "training": {
+    "max_steps": 999999999,
+    "epochs": 20,
+    "batch_size": 1,
+    "gradient_accumulation": 8,
+    "seed": 42,
+    "gradient_checkpointing": true,
+    "timestep_sampling": "uniform",
+    "logit_mean": 0.0,
+    "logit_std": 1.0,
+    "max_grad_norm": 1.0
+  },
+  "optimizer": {
+    "type": "muon",
+    "learning_rate": 0.0005,
+    "weight_decay": 0.01,
+    "kwargs": {
+      "adjust_lr_fn": "match_rms_adamw"
+    }
+  },
+  "scheduler": {
+    "type": "constant",
+    "warmup_steps": 0
+  },
+  "loader": {
+    "num_workers": 2,
+    "pin_memory": true,
+    "prefetch_factor": 2,
+    "persistent_workers": true
+  },
+  "save": {
+    "every_steps": 0,
+    "every_epochs": 1,
+    "save_state": true
+  },
+  "sample": {
+    "preview": {
+      "enabled": true,
+      "every_steps": 0,
+      "every_epochs": 1
+    },
+    "prompt": "deepseek-tan holding an acoustic guitar and strumming it, standing on a rooftop at sunset, warm rim light, anime illustration, detailed hands and strings",
+    "negative_prompt": "",
+    "width": 832,
+    "height": 1216,
+    "num_inference_steps": 20,
+    "guidance_scale": 3.0,
+    "seed": 42
+  }
+}

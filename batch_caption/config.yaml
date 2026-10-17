@@ -1,0 +1,16 @@
+# 批量打标配置。相对路径以本文件所在目录为基准（CLI 覆盖的路径以当前工作目录为基准）。
+base_url: http://127.0.0.1:8317/v1
+api_key: togawasakiko
+model: deepseek/deepseek-v4.1-flash
+reasoning_effort: high
+max_tokens: 16384
+temperature: 1
+top_p: 0.95
+concurrency: 6
+retries: 2
+timeout: 300
+input_dir: ../test_image
+output_dir: output
+max_image_size: 2048
+prompt_file: prompt.txt
+reference: 'The character is named deepseek-tan. In most cases she wears a maid outfit. Treat this as reference only; describe the outfit actually visible in the image.'

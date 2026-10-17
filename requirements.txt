@@ -1,0 +1,14 @@
+# Install a CUDA 12.8+ PyTorch build for RTX 5080 before these packages.
+torch>=2.9
+diffusers==0.41.0
+transformers==5.20.1
+accelerate==1.15.0
+safetensors==0.8.0
+Pillow>=10
+numpy
+einops
+toml
+tqdm
+openai>=1.66.3
+Pillow>=11.0.0
+PyYAML>=6.0.2

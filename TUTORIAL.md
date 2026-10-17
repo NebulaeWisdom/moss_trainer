@@ -295,8 +295,8 @@ preview的文本embedding只存在于进程内：不写进`state.pt`/`config.jso
 ## 6. 预设文件
 
 - [`plain_txt.json`](configs/plain_txt.json)：纯文本caption基准——`caption_format="plain"`（同名`.txt`，缺失时用`dataset.caption`）、`resolutions=[1024]`、`bucket_step=16`、LoRA rank4/alpha4、Muon lr5e-4、`epochs=20`、`batch_size=1`+`gradient_accumulation=8`、每epoch保存state、preview `enabled=true`+`every_epochs=1`（832×1216）。
-- [`moss_official.json`](configs/moss_official.json)：`plain_txt.json`的官方caption版本——`caption_format="moss_official"`、`caption_dir=test_image_caption`、同名`.json`的long/medium/short三级全部进cache、每步等权抽一级；其余与`plain_txt.json`相同，另显式开启`training.attention_backend="cudnn"`与`training.compile_pointwise=true`（两项见第5节`training`小节与README的实测表）。
+- [`moss_official.json`](configs/moss_official.json)：`plain_txt.json`的官方caption版本——`caption_format="moss_official"`、`caption_dir=test_image_caption`、同名`.json`的long/medium/short三级全部进cache、每步等权抽一级；其余与`plain_txt.json`相同。
 - [`res768.json`](configs/res768.json)：`moss_official.json`的768档——只把`resolutions`改为`[768]`。
 - [`lokr_factor16.json`](configs/lokr_factor16.json)：`moss_official.json`的LoKr版本——`adapter.algo="lokr"`、`adapter.kwargs={"use_scalar":true,"factor":16}`；其余与`moss_official.json`相同。
 
-`res768.json`与`lokr_factor16.json`不写两个性能项：新run未写`attention_backend`时同样解析为`cudnn`，`compile_pointwise`取默认`false`（关掉pointwise编译仍保留cuDNN收益）。
+四个预设都显式写`training.attention_backend="cudnn"`与`training.compile_pointwise=true`（两项见第5节`training`小节与README的实测表）；新run未写`attention_backend`时解析为`cudnn`，未写`compile_pointwise`时取默认`false`。

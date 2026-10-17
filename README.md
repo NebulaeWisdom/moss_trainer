@@ -16,7 +16,7 @@ git clone https://github.com/KohakuBlueleaf/LyCORIS
 pip install ./LyCORIS
 ```
 
-官方预设默认开启 `training.compile_pointwise`：Triton 已由上面的 `requirements.txt` 按平台安装（Linux `triton`，Windows `triton-windows`，实测 `3.8.0.post28`），另需 PyTorch 暴露 Inductor 的 `emulate_precision_casts`（实测 `2.14.0+cu130`）；缺任一项启动即显式报错。PyTorch 版本不满足时，把配置里的 `compile_pointwise` 设为 `false`，cuDNN 收益仍在（见「训练性能」）。
+预设默认开启 `training.compile_pointwise`：Triton 已由上面的 `requirements.txt` 按平台安装（Linux `triton`，Windows `triton-windows`，实测 `3.8.0.post28`），另需 PyTorch 暴露 Inductor 的 `emulate_precision_casts`（实测 `2.14.0+cu130`）；缺任一项启动即显式报错。PyTorch 版本不满足时，把配置里的 `compile_pointwise` 设为 `false`，cuDNN 收益仍在（见「训练性能」）。
 
 ## 模型
 
@@ -104,7 +104,7 @@ venv/Scripts/python.exe -B -m unittest discover -s moss_trainer/tests -p test_tr
 ### 两个性能选项
 
 - **`training.attention_backend`** — `cudnn`（新 run 默认）或 `auto`（完全沿用 stock 选择）；实测收益见上表。
-- **`training.compile_pointwise`** — 默认 `false`；官方预设 `configs/moss_official.json` 显式开 `true`。开启需要已安装的 PyTorch 暴露 Inductor 的 `emulate_precision_casts`（实测 2.14.0+cu130）、可用的 Triton（Windows 实测 `triton-windows 3.8.0.post28`）与 CUDA；缺任一项会在加载模型前显式报错，不会静默退回 eager。`false` 时完全不引入 `torch.compile`，其他环境照常可跑，且仍保留 cuDNN 收益。
+- **`training.compile_pointwise`** — 默认 `false`；`configs/` 下四个预设都显式开 `true`。开启需要已安装的 PyTorch 暴露 Inductor 的 `emulate_precision_casts`（实测 2.14.0+cu130）、可用的 Triton（Windows 实测 `triton-windows 3.8.0.post28`）与 CUDA；缺任一项会在加载模型前显式报错，不会静默退回 eager。`false` 时完全不引入 `torch.compile`，其他环境照常可跑，且仍保留 cuDNN 收益。
 
 两者只改训练进程内的内核选择与点算子实现，不改冻结基座权重、分桶、数据或步数；详细默认值、作用域与回退规则见 [TUTORIAL.md](TUTORIAL.md) 第 5 节。
 
@@ -133,9 +133,9 @@ python samples.py --config runs/my-run/config.json `
 
 | 预设 | 用途 |
 |---|---|
-| `configs/moss_official.json` | 官方 JSON caption，显式开 `attention_backend="cudnn"` + `compile_pointwise=true` |
+| `configs/moss_official.json` | 官方 JSON caption |
 | `configs/plain_txt.json` | 同名 `.txt` caption |
 | `configs/res768.json` | 768 面积档 |
 | `configs/lokr_factor16.json` | LoKr，factor=16 |
 
-其余预设不写这两个性能项：新 run 未写 `attention_backend` 时同样解析为 `cudnn`，`compile_pointwise` 取默认 `false`。
+四个预设都显式写 `attention_backend="cudnn"` + `compile_pointwise=true`。

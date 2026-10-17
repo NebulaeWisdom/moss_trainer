@@ -171,6 +171,7 @@ def main() -> None:
         cache_dir = args.cache_dir.resolve()
     attention_backend = runtime.resolve_attention_backend(config, resumed=resume is not None)
     compile_pointwise = runtime.resolve_compile_pointwise(config)
+    compile_blocks = runtime.resolve_compile_blocks(config)
     checkpoint_group_size = runtime.resolve_checkpoint_group_size(config)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -270,7 +271,7 @@ def main() -> None:
         file=sys.stdout,
     )
     with (
-        runtime.training_kernels(config),
+        runtime.training_kernels(config, dit=dit, network=network),
         (output_dir / "train.jsonl").open("x", encoding="utf-8") as handle,
         tqdm(
             total=total_steps, initial=global_step, desc="Training", unit="step",
@@ -301,6 +302,8 @@ def main() -> None:
                 "loader": config["loader"],
                 "attention_backend": attention_backend,
                 "compile_pointwise": compile_pointwise,
+                "compile_blocks": compile_blocks,
+                "compile_blocks_mode": training.get("compile_blocks_mode") if compile_blocks else None,
                 "checkpoint_group_size": checkpoint_group_size,
                 "optimizers": {
                     name: {

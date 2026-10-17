@@ -65,6 +65,38 @@ def resolve_compile_pointwise(config: dict) -> bool:
     return enabled
 
 
+def _compile_blocks_enabled(config: dict) -> bool:
+    training = config["training"]
+    enabled = training.get("compile_blocks", False)
+    if type(enabled) is not bool:
+        raise ValueError(f"training.compile_blocks must be a boolean, got {enabled!r}")
+    if enabled:
+        if training.get("compile_pointwise") is not True:
+            raise ValueError("training.compile_blocks=true requires training.compile_pointwise=true")
+        if config.get("adapter", {}).get("algo") != "lora":
+            raise ValueError("training.compile_blocks supports only adapter.algo='lora'; leave it false for LoKr")
+        from .kernels import BLOCK_COMPILE_MODES
+
+        mode = training.get("compile_blocks_mode", "default")
+        if type(mode) is not str or mode not in BLOCK_COMPILE_MODES:
+            raise ValueError(f"training.compile_blocks_mode must be one of {BLOCK_COMPILE_MODES}, got {mode!r}")
+    return enabled
+
+
+def resolve_compile_blocks(config: dict) -> bool:
+    """Persist opt-in block compilation; old checkpoints retain eager blocks."""
+    config["training"].setdefault("compile_blocks", False)
+    enabled = _compile_blocks_enabled(config)
+    if enabled:
+        from .kernels import validate_block_support
+
+        mode = config["training"].setdefault("compile_blocks_mode", "default")
+        validate_block_support(mode)
+        logger.info("resolved training.compile_blocks_mode=%s", mode)
+    logger.info("resolved training.compile_blocks=%s", enabled)
+    return enabled
+
+
 def resolve_checkpoint_group_size(config: dict) -> int:
     """Persist group one for new runs and stored configs predating grouping."""
     training = config["training"]
@@ -77,8 +109,8 @@ def resolve_checkpoint_group_size(config: dict) -> int:
 
 
 @contextlib.contextmanager
-def training_kernels(config: dict) -> Iterator[None]:
-    """Scope attention priority and optional pointwise compilation to training.
+def training_kernels(config: dict, *, dit=None, network=None) -> Iterator[None]:
+    """Scope attention and optional pointwise/main-block compilation to training.
 
     The caller includes backward/recomputation and DiT previews, but excludes
     text-encoder loading/encoding. All patched functions and backend priorities
@@ -94,6 +126,9 @@ def training_kernels(config: dict) -> Iterator[None]:
         raise ValueError(
             f"training.compile_pointwise must be a boolean, got {compile_pointwise!r}"
         )
+    compile_blocks = _compile_blocks_enabled(config)
+    if compile_blocks and (dit is None or network is None):
+        raise ValueError("training.compile_blocks=true requires the adapted dit and network")
     with contextlib.ExitStack() as stack:
         if backend == "cudnn":
             # Refuse rather than guess a fallback on older torch releases.
@@ -114,6 +149,10 @@ def training_kernels(config: dict) -> Iterator[None]:
             from .kernels import pointwise_kernels
 
             stack.enter_context(pointwise_kernels())
+        if compile_blocks:
+            from .kernels import block_kernels
+
+            stack.enter_context(block_kernels(dit, network, mode=config["training"].get("compile_blocks_mode", "default")))
         yield
 
 

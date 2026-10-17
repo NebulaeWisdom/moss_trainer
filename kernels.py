@@ -1,4 +1,4 @@
-"""Scoped DiT pointwise compilation with eager per-operation precision."""
+"""Scoped DiT pointwise and main-block compilation with eager precision casts."""
 
 from __future__ import annotations
 
@@ -7,12 +7,31 @@ import importlib
 import importlib.util
 import logging
 import os
+import time
 from collections.abc import Iterator
+from functools import wraps
 from pathlib import Path
+from types import MethodType
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+BLOCK_COMPILE_MODES = ("default", "max-autotune-no-cudagraphs")
+
+_BLOCK_OPTIONS = {
+    "emulate_precision_casts": True,
+    "triton.cudagraphs": False,
+    "autotune_cudagraph_benchmarking": False,
+    "fallback_random": True,  # ATen RNG/dropout operators stay inside the full graph.
+}
+_BLOCK_DYNAMO_SETTINGS = {
+    "suppress_errors": False,
+    "fail_on_recompile_limit_hit": True,
+    "skip_nnmodule_hook_guards": False,
+    # Python adapter scales remain guarded constants, not FP64 CPU tensors.
+    "specialize_float": True,
+}
 
 
 def validate_pointwise_support() -> None:
@@ -45,9 +64,37 @@ def validate_pointwise_support() -> None:
         )
 
 
-def _compile(function):
+def validate_block_support(mode: str = "default") -> dict:
+    """Validate support and return the mode's merged Inductor options."""
+    if type(mode) is not str or mode not in BLOCK_COMPILE_MODES:
+        raise ValueError(f"training.compile_blocks_mode must be one of {BLOCK_COMPILE_MODES}, got {mode!r}")
+    validate_pointwise_support()
+    from torch import _inductor
+    from torch._dynamo import config
+
+    if not callable(getattr(_inductor, "list_mode_options", None)):
+        raise RuntimeError("training.compile_blocks requires torch._inductor.list_mode_options")
+    options = dict(_inductor.list_mode_options(mode=mode, dynamic=True))
+    options.update(_BLOCK_OPTIONS)
+    if mode == "default":
+        # Keep the default mode free of environment-enabled GEMM/max autotuning.
+        options.update(max_autotune=False, max_autotune_gemm=False,
+                       max_autotune_pointwise=False, coordinate_descent_tuning=False)
+    missing = options.keys() - set(_inductor.list_options())
+    if missing:
+        raise RuntimeError(f"training.compile_blocks requires Inductor options: {sorted(missing)}")
+    missing = [name for name in (*_BLOCK_DYNAMO_SETTINGS, "disable") if not hasattr(config, name)]
+    if missing or not callable(getattr(config, "patch", None)):
+        raise RuntimeError(f"training.compile_blocks requires scoped Dynamo settings: {missing}")
+    if config.disable:
+        raise RuntimeError("training.compile_blocks requires enabled Dynamo; eager fallback is not supported")
+    return options
+
+
+def _compile(function, *, options=None):
     return torch.compile(
-        function, dynamic=True, fullgraph=True, options={"emulate_precision_casts": True}
+        function, backend="inductor", dynamic=True, fullgraph=True,
+        options={"emulate_precision_casts": True} if options is None else options,
     )
 
 
@@ -126,3 +173,99 @@ def pointwise_kernels() -> Iterator[None]:
                 os.environ.pop("CC", None)
             else:
                 os.environ["CC"] = original_cc
+
+
+def _compile_block_forward(original_forward, options):
+    from torch._dynamo import config
+
+    # Separate code objects share graphs across blocks without closing over a
+    # particular layer. Normal guards retain adapter/module state correctness.
+    def preview(self, x, rope, modulation):
+        return original_forward(self, x, rope, modulation)
+
+    def training_frozen_input(self, x, rope, modulation):
+        return original_forward(self, x, rope, modulation)
+
+    def training_input_grad(self, x, rope, modulation):
+        return original_forward(self, x, rope, modulation)
+
+    lanes = tuple(_compile(fn, options=options)
+                  for fn in (preview, training_frozen_input, training_input_grad))
+    seen = [False, False, False]
+
+    def call_compiled(self, x, rope, modulation):
+        lane = 0 if not torch.is_grad_enabled() else 2 if x.requires_grad else 1
+        if seen[lane]:
+            return lanes[lane](self, x, rope, modulation)
+        started = time.perf_counter()
+        output = lanes[lane](self, x, rope, modulation)
+        seen[lane] = True
+        logger.info(
+            "block compiler first call: lane=%s shape=%s host_seconds=%.6f "
+            "(includes lazy forward compilation, excludes lazy backward compilation)",
+            ("preview", "training_frozen_input", "training_input_grad")[lane],
+            tuple(x.shape), time.perf_counter() - started,
+        )
+        return output
+
+    @wraps(original_forward)
+    def forward(self, x, rope, modulation):
+        # Config overrides are thread-local in supported torch builds. Checkpoint
+        # recomputation can run on an autograd worker without the lifecycle patch.
+        if (config.specialize_float and not config.suppress_errors
+                and config.fail_on_recompile_limit_hit and not config.skip_nnmodule_hook_guards):
+            return call_compiled(self, x, rope, modulation)
+        with config.patch(_BLOCK_DYNAMO_SETTINGS):
+            return call_compiled(self, x, rope, modulation)
+
+    return forward
+
+
+@contextlib.contextmanager
+def block_kernels(dit, network, *, mode: str = "default") -> Iterator[None]:
+    """Compile adapted main-block forwards inside the enclosing pointwise scope."""
+    from lycoris.modules.locon import LoConModule
+    from torch._dynamo import config
+    from .vendor.pipeline_moss_image import _Block
+
+    options = validate_block_support(mode)
+    blocks = tuple(dit.layers)
+    if not blocks or any(type(block) is not _Block for block in blocks):
+        raise RuntimeError("training.compile_blocks requires the original main _Block classes")
+    original_forward = _Block.forward
+    if any(not isinstance(block.forward, MethodType)
+           or block.forward.__self__ is not block
+           or block.forward.__func__ is not original_forward for block in blocks):
+        raise RuntimeError("training.compile_blocks requires unmodified main block forwards")
+    if any(p.requires_grad for p in dit.parameters()):
+        raise RuntimeError("training.compile_blocks requires a frozen base DiT")
+    parameters = tuple(network.parameters())
+    if not parameters or any(not p.requires_grad or p.dtype != torch.float32 for p in parameters):
+        raise RuntimeError("training.compile_blocks requires trainable FP32 LyCORIS parameters")
+    adapters = tuple(network.loras)
+    if not adapters or any(type(adapter) is not LoConModule for adapter in adapters):
+        raise RuntimeError("training.compile_blocks supports only adapter.algo='lora'")
+    if any(not isinstance(adapter.org_module[0].forward, MethodType)
+           or adapter.org_module[0].forward.__self__ is not adapter for adapter in adapters):
+        raise RuntimeError("training.compile_blocks must be entered after LyCORIS apply_to")
+    missing = object()
+    saved = []
+    with config.patch(_BLOCK_DYNAMO_SETTINGS):
+        dispatch = _compile_block_forward(original_forward, options)
+        try:
+            for block in blocks:
+                previous = block.__dict__.get("forward", missing)
+                block.forward = MethodType(dispatch, block)
+                saved.append((block, previous))
+            logger.info(
+                "enabled DiT block compilation: blocks=%d mode=%s dynamic=True fullgraph=True options=%s "
+                "Dynamo settings=%s (also scoped per calling thread)",
+                len(blocks), mode, options, _BLOCK_DYNAMO_SETTINGS,
+            )
+            yield
+        finally:
+            for block, previous in saved:
+                if previous is missing:
+                    del block.forward
+                else:
+                    block.forward = previous

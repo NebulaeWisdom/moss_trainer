@@ -96,17 +96,38 @@ python launch.py train --config temp/bench-cudnn.json --cache-dir temp/my-cache 
 
 ```powershell
 venv/Scripts/python.exe -B -m unittest discover -s moss_trainer/tests -p test_training_kernels.py -v
-# 6 tests passed, 0 skipped（含 CUDA checkpointed-grad），10.829s
+# 13 tests passed（含真实 CUDA、block/dropout/RNG 与重算线程契约）
 ```
 
 数值对照（111 项）按显式容差判定：全部有限，前向/loss 用相对 L2 ≤1%，梯度可用绝对上限 ≤1e-5 兜底，全部通过。以上只覆盖 12 步 A/B 与一个 epoch（37 步）的实测；**全部 20 epoch 的完整训练与收敛质量没有跑**，本页不给出收敛结论。
 
-### 两个性能选项
+### 性能选项
 
 - **`training.attention_backend`** — `cudnn`（新 run 默认）或 `auto`（完全沿用 stock 选择）；实测收益见上表。
 - **`training.compile_pointwise`** — 默认 `false`；`configs/` 下四个预设都显式开 `true`。开启需要已安装的 PyTorch 暴露 Inductor 的 `emulate_precision_casts`（实测 2.14.0+cu130）、可用的 Triton（Windows 实测 `triton-windows 3.8.0.post28`）与 CUDA；缺任一项会在加载模型前显式报错，不会静默退回 eager。`false` 时完全不引入 `torch.compile`，其他环境照常可跑，且仍保留 cuDNN 收益。
+- **`training.compile_blocks`** — 默认 `false`，四个预设均保持未开启。只支持 `adapter.algo="lora"`，且必须显式满足 `compile_pointwise=true`；不满足时启动报错，不会替你改配置。开启后在 LyCORIS 挂载、resume 恢复之后编译全部 42 个主 block 的原始 forward，包含原有 LoRA 调用；不编译 TE/VAE，不替换模块或参数，不改分桶。使用动态形状、fullgraph 与 BF16 精度转换模拟，不启用 CUDA graphs；随机/dropout 算子保留 ATen RNG 路径。编译失败直接报错。LoKr 尚未通过相同数值契约，开启此项会明确拒绝；`compile_blocks=false` 的 LoKr 训练不变。
+- **`training.compile_blocks_mode`** — 仅在 `compile_blocks=true` 时校验、补默认值并生效；取 `default`（默认，不做 GEMM autotune）或 `max-autotune-no-cudagraphs`（显式启用 Inductor autotune，可能增加首次编译/调优开销）。使用 PyTorch 自带 mode 选项映射，再合并相同的精度/RNG约束与禁用 CUDA graphs 设置；不是改变基座精度的选项。启用时解析后的 mode 随配置/state 保存，并写入 start 日志；关闭 block 编译时不新增默认 mode、不校验该项，start 日志记为 `null`。
 
-两者只改训练进程内的内核选择与点算子实现，不改冻结基座权重、分桶、数据或步数；详细默认值、作用域与回退规则见 [TUTORIAL.md](TUTORIAL.md) 第 5 节。
+这些选项只作用于训练进程中的训练、反向重算与 live preview，退出时还原函数、实例 forward 和拥有的编译器环境；独立 `sample.py`/`samples.py` 不因训练配置而开启 block 编译。`compile_blocks` 随 run 配置/state 保存，旧 state 缺该项时保持 `false`；详细行为见 [TUTORIAL.md](TUTORIAL.md) 第 5 节。
+
+**block 编译的现有证据**：临时原型的同口径无插桩 12-step A/B，未开启 block 编译的 warm median 为 **2.195143 s/sample**：
+
+| block 模式 | warm median s/sample | 相对吞吐 | 本次进程首步秒数（含编译/autotune，部分缓存已存在） | 对照 step loss 最大绝对差 |
+|---|---:|---:|---:|---:|
+| `default` | 2.026771 | +8.3% | 35.68 | 0.001108 |
+| `max-autotune-no-cudagraphs` | 1.944467 | +12.89% | 129.14 | 0.0002687 |
+
+`default`记录为`temp/train-next-opt/block-default-thread-12`。35.68s与129.14s是**本次进程首步**：复用了此前探测留下的部分共享Triton/Inductor缓存，**不是清空缓存后的冷启动完整编译时间**。两种模式均**不是 bitexact**；这些额外首步成本不能从 warm median 中消失，短任务可能不划算。BF16 冻结基座和 FP32 适配器精度保持不变。
+
+**发布集成实跑（autotune）**：直接使用生产`launch.py`，显式设置`compile_blocks=true`与`compile_blocks_mode="max-autotune-no-cudagraphs"`，已完成**38个update、297张样本**（完整289图epoch，再训练下一epoch的8张）。第37步保存adapter与完整state，完成**20步、832×1216 live preview**，随后成功回到训练并完成第38步。
+
+- 同口径前12步的warm median：**1.93800625 vs 2.195143125 s/sample**，吞吐 **+13.268%**；对应step loss最大绝对差 **4.17768955e-4**，不宣称bitexact。整个38步run的warm样本加权耗时为**1.944404 s/sample**；这一全run指标不直接套用前12步的相对提升比例。
+- 训练阶段torch记录的峰值显存为**11.522 GiB**；这不是全进程或WDDM dedicated显存口径。preview耗时**46.699s**，其中首次preview图入口约**24.68s**（含惰性编译）。本次进程首步为**23.24s**，已有编译缓存较暖，仍不是清空缓存后的冷启动测量。
+- 集成内核契约测试**13/13通过**，含真实CUDA。
+- **跨进程resume已实跑**：生产`launch.py`从第37步state续到第38步；与不中断run相比，step38 loss **0.8430308103561401完全相同**，config、scheduler、游标及CPU/CUDA/噪声生成器/Python/NumPy RNG均完全一致。记录：`temp/train-next-opt/production-block-resume-comparison.json`。
+- **下一次update后的数值并非bitexact**：FP32 adapter状态494/1260个张量不同，maxabs **1.6793608665e-4**、最大单张量relative L2约**0.002355**；optimizer状态494/504个张量不同，maxabs **9.0394e-7**；BF16导出494/756个张量不同，maxabs **4.8828125e-4**。这是各自完成第38次update后的对照，不是刚加载第37步state时的比较；**保存边界的状态恢复与后续计算轨迹逐bit复现是不同契约**。
+
+autotune选择可能随首个动态shape hint、实测计时和缓存状态变化，checkpoint不保存编译图/调优选择；这是跨进程数值风险，不是本次差异已被归因于某一种kernel。既有未开启block编译的resume实跑也有已记录的浮点漂移，以上不新增bitexact保证。**完整20 epoch收敛与质量未验证**。
 
 ### 等价性边界
 

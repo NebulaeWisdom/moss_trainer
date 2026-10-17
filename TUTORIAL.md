@@ -61,7 +61,7 @@ launch.py train -> train.main
 
 普通训练update**不加载TE或VAE**；TE只在启动阶段（preview生效时）加载一次，训练循环里不再出现；preview也不加载TE、不搬动DiT，它复用启动时编码好的CPU embedding，只临时加载冻结VAE。加噪输入是`(1−σ)×latent+σ×noise`，DiT接收`1000σ`并预测`noise−latent`。训练数据、TE和基座DiT都不被optimizer改写。
 
-**attention与点算子**：训练循环（含反向重算与preview）跑在一个作用域里：把原生SDPA优先级设为cuDNN优先（`training.attention_backend`），并可选编译DiT的RMSNorm/SiTU/RoPE点算子（`training.compile_pointwise`，两项见第5节）。该作用域在preview的启动文本编码**之后**才进入，所以TE编码行为与`auto`/未编译时一致；两者都不改冻结基座权重、不替换适配器kernel，也不改变分桶、数据与步数。
+**attention与编译**：训练循环（含反向重算与preview）跑在一个作用域里：把原生SDPA设为cuDNN优先（`training.attention_backend`），可选编译DiT的RMSNorm/SiTU/RoPE点算子（`training.compile_pointwise`），还可显式开启LoRA主block原始forward编译（`training.compile_blocks`，均见第5节）。作用域在preview启动文本编码、LyCORIS挂载和resume恢复**之后**进入；TE/VAE不编译，冻结基座dtype、适配器参数身份、分桶、数据与步数不变。block编译纳入原有LyCORIS调用，不手工重写其数学；退出时还原作用域内的全局点算子与实例forward。
 
 **train的stdout与`caption_stats`**：训练不再每step打印一行JSON——stdout是一条进度条（百分比、已处理/总step、step/s、已用时间/ETA）加当前loss、LR、显存和token范围；其余只有start/save/preview/finish/error这类生命周期行。`train.jsonl`仍每step写一条结构化记录，但字段`captions`/`empty_captions`已由固定形状的`caption_stats`取代：`count`是本step样本数，`levels`给出`plain`/`long`/`medium`/`short`各自计数（按dropout前的选中level归属），`dropped`是被`caption_dropout`换成空串的条数，`chars_min`/`chars_max`是最终文本的字符数极值，`tokens_min`/`tokens_max`是最终选中embedding的token数极值。一个step里的多个microbatch汇总时：`count`/`levels`/`dropped`相加，min取最小、max取最大。这些字段只含整数，不含caption原文，所以每step的文本元数据大小有界、不随caption长度增长；这不等于整个`train.jsonl`每行字节数恒定（`data_indices`、`buckets`、`batch_sizes`、`sample_count`仍随batch变化），也没有在千万级记录上做过吞吐实测。每个step记录另带`sample_count`（该窗口实际样本数，等于`batch_sizes`之和）、`batch_sizes`（每个microbatch的图片数）与`microbatch_count`（窗口内批次数）：`batch_size×gradient_accumulation`只是样本数上界，桶尾批更小（见第5节training）。preview生效时的启动文本编码只在`start`事件里留下数值`preview_text_encoding_seconds`与`preview_text_encoding_count`（未启用或周期全为0时都是0），同样不含提示词原文。
 
@@ -235,6 +235,20 @@ Muon只接收`ndim==2`的参数，其余交给辅助AdamW；没有2D参数时只
 
 - **`training.compile_pointwise`〔train〕** — 默认`false`。`true`只编译DiT的点算子：`_RMSNorm`、SiTU、RoPE，用`dynamic=True`/`fullgraph=True`/`emulate_precision_casts=True`，即保持eager的BF16逐算子舍入；不做全模型compile、不替换LoRA/LoKr kernel，冻结基座与数据路径不变。开启要求：已安装的PyTorch暴露Inductor的`emulate_precision_casts`选项（实测2.14.0+cu130）、可用的Triton（Windows实测`triton-windows 3.8.0.post28`）与CUDA；缺任一项会在加载DiT前显式报错，不会静默退回eager。**resume旧state（其中配置没有这项）解析为`false`**；解析后的取值同样写进run的`config.json`与`state.pt`里的config，`train.jsonl`的`start`事件带`compile_pointwise`。编译缓存由`launch.py`统一放进仓库`temp/torchinductor-cache`与`temp/triton-cache`；Windows上若`CC`未设置，会先用Triton自带的TinyCC（`tcc.exe`）编译生成的kernel。RMSNorm按rank3/rank4 × 输入是否需要梯度的4个固定入口编译（不是按桶或形状生成入口），避免Dynamo按调用点无界重编译；生产 run 跑完全部289张图/26个桶未出现重编译溢出。`false`时完全不引入`torch.compile`，其他环境照常可跑，且仍保留`attention_backend`的cuDNN收益；改这项不需要新cache。保持eager的BF16逐算子舍入，不做精度降级，但reduction与梯度不保证逐bit一致；实测收益见README的实测表。
 
+- **`training.compile_blocks`〔train〕** — 默认`false`，严格布尔值；仅支持`adapter.algo="lora"`，必须同时有`compile_pointwise=true`，否则在加载模型前报错。LoKr尚未通过相同数值契约，因此显式拒绝该组合；关闭此项时LoKr行为不变。进入现有训练作用域后，全部42个主block共享三个显式传入`self`的编译入口（no-grad preview、冻结输入训练、需输入梯度的训练），调用捕获的原始forward，保留LyCORIS挂载后的模块调用、类名、state-dict键和参数对象。仍使用`dynamic=True`/`fullgraph=True`/`emulate_precision_casts=True`，始终关闭CUDA graphs；`fallback_random=True`显式保留ATen随机/dropout算子及其RNG消耗顺序，不是编译错误后的eager兜底。Python缩放常量使用受guard保护的`specialize_float=True`；Dynamo设置在训练线程和checkpoint重算线程分别作用并还原，避免线程局部配置丢失。缺所需API/选项、错误、重编译上限溢出均直接报错，不关闭guard或静默退回eager。
+
+  `compile_blocks`写入run的`config.json`、完整state与`train.jsonl`的`start`事件；旧state缺此项时解析为`false`。resume先恢复原始FP32适配器/optimizer/RNG，再安装编译入口，第一次调用才惰性编译。live preview复用同一个DiT，临时切到eval/no-grad后恢复训练；独立`sample.py`/`samples.py`不自动启用训练编译。正常或异常退出都还原实例forward及外层点算子/编译器环境。
+
+- **`training.compile_blocks_mode`〔train〕** — 仅当`compile_blocks=true`时生效并严格校验字符串枚举，缺省为`default`；另一选项是`max-autotune-no-cudagraphs`。`default`显式禁用GEMM/max autotune；另一模式采用`torch._inductor.list_mode_options`提供的autotune设置，再合并相同精度转换、ATen RNG与禁用CUDA graphs约束。开启时解析后的mode写入配置/state和start事件；旧的已开启block编译配置若没有mode则补`default`，已有mode在resume时保持；关闭block编译时忽略该项、不补默认值，start事件记`null`。没有其他autotune旋钮，四个预设仍不启用block编译，也不改变冻结BF16基座或FP32适配器。
+
+  临时原型12-step对照：未开启block编译的warm median为2.195143 s/sample，`default`为2.026771（吞吐+8.3%），autotune为1.944467（+12.89%）；**本次进程首步**含编译/autotune分别为35.68s与129.14s。两次进程都可能复用此前探测留下的部分共享Triton/Inductor缓存，**不是清空缓存后的冷启动完整编译时间**；短任务仍须计入实际首步开销。两者对照step loss最大绝对差分别为0.001108与0.0002687，均非bitexact；不据此推荐降低基座精度。
+
+  **发布集成已实跑**：通过生产`launch.py`开启autotune block编译，完成38个update/297张样本（完整289图epoch+下一epoch的8张）；第37步保存adapter/state、生成20步832×1216 live preview后，成功恢复训练到第38步。同口径前12步warm median为1.93800625 vs基线2.195143125 s/sample（吞吐+13.268%），step loss最大绝对差4.17768955e-4；全38步run的warm样本加权耗时1.944404 s/sample。训练阶段torch峰值11.522 GiB；preview 46.699s含首次preview图入口约24.68s（含惰性编译）；本次进程首步23.24s使用了较暖的编译缓存。集成内核契约测试13/13通过，含真实CUDA；详见README「性能选项」。
+
+  **跨进程resume已实跑**：生产`launch.py`从第37步state续到第38步，与不中断run的step38 loss（0.8430308103561401）、config/scheduler/游标和全部CPU/CUDA/噪声/Python/NumPy RNG完全一致；但完成下一次update后，FP32 adapter、optimizer状态与BF16导出的maxabs分别为1.6793608665e-4、9.0394e-7、4.8828125e-4，**并非bitexact**。这里比较的是更新后的状态，不能把保存边界的状态恢复等同于下一update的数值轨迹逐bit复现；完整张量计数与记录见README。
+
+  **边界**：autotune可能因首个动态shape hint、计时与缓存状态不同而选到其他kernel，checkpoint不保存编译缓存/调优选择；这是数值风险，不是本次漂移的单一原因已被证实。既有未开启block编译的resume也有浮点漂移，不作跨进程bitexact保证。以上仅是短程数值、吞吐、preview与resume证据，**无20 epoch收敛或质量证明**。
+
 **按样本加权的累积loss**：一个update的loss是`Σ(microbatch_mean × actual_batch_size) / window_samples`，即窗口内每个样本的权重都是`1/window_samples`（`window_samples`由sampler按批次计划直接算出，不读取被跳过的数据）。一批只含同一个桶（同宽高）的图片，所以该批的元素均值等于批内每样本均值的平均，加权后窗口loss正好是“每样本均值”的平均。`batch_size=1`时`window_samples`等于microbatch数，数学与旧实现完全相同，旧结果与本文档继续有效；旧实现`batch_size>1`且窗口内含不等大小批（桶尾）时用mean-of-batch-means，小批里的样本被高估权重，现在改为每样本等权（resume兼容性见第4节）。
 
 **原生前向仍逐样本**：vendor的DiT `forward`按batch维逐样本循环（每个样本单独跑42个block、单独拼图像与文本token），所以`batch_size>1`不会自动把单样本内部的计算并行化，只是把多个样本串进同一个update。本地另有一个把样本合并成masked batched forward的向量化原型（工作区根目录`temp/train-batch-opt/vectorized_candidate.py`，即`../temp/...`，本地实验、不入库），它**不是生产路径**，发布代码始终走原生逐样本前向。该原型已弃用：`bs3`+offload超出WDDM上限（reserved 17.777GiB），BF16下LoKr的2/1080项比较超出预设容差（FP32结构诊断全过），`bs2`向量路径未测。
@@ -321,3 +335,4 @@ preview的文本embedding只存在于进程内：不写进`state.pt`/`config.jso
 - [`lokr_factor16.json`](configs/lokr_factor16.json)：`moss_official.json`的LoKr版本——`adapter.algo="lokr"`、`adapter.kwargs={"use_scalar":true,"factor":16}`；其余与`moss_official.json`相同。
 
 四个预设都显式写`training.attention_backend="cudnn"`与`training.compile_pointwise=true`（两项见第5节`training`小节与README的实测表）；新run未写`attention_backend`时解析为`cudnn`，未写`compile_pointwise`时取默认`false`。四个预设也都保持`batch_size=1`+`gradient_accumulation=8`，且都不写`training.checkpoint_group_size`（取默认`1`）：复测显示bs2/bs3没有实质吞吐收益（见README的16GB实测表），所以预设不改；要试分组或更大batch，请复制预设到自己新建的配置里再改。
+`training.compile_blocks`在四个预设中都未开启，取默认`false`；要试验仅支持LoRA的block编译，复制相应LoRA预设后显式添加`"compile_blocks": true`，不要修改LoKr预设或把该短程吞吐结果当成质量保证。

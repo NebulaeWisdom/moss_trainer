@@ -43,7 +43,9 @@
     "timestep_sampling": "uniform",
     "logit_mean": 0.0,
     "logit_std": 1.0,
-    "max_grad_norm": 1.0
+    "max_grad_norm": 1.0,
+    "attention_backend": "cudnn",
+    "compile_pointwise": true
   },
   "optimizer": {
     "type": "muon",

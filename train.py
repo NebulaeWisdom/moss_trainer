@@ -164,6 +164,8 @@ def main() -> None:
     else:
         config = json.loads(args.config.read_text(encoding="utf-8"))
         cache_dir = args.cache_dir.resolve()
+    attention_backend = runtime.resolve_attention_backend(config, resumed=resume is not None)
+    compile_pointwise = runtime.resolve_compile_pointwise(config)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
 
@@ -261,6 +263,7 @@ def main() -> None:
         file=sys.stdout,
     )
     with (
+        runtime.training_kernels(config),
         (output_dir / "train.jsonl").open("x", encoding="utf-8") as handle,
         tqdm(
             total=total_steps, initial=global_step, desc="Training", unit="step",
@@ -289,6 +292,8 @@ def main() -> None:
                 "next_batch": next_batch,
                 "trainable_parameters": sum(parameter.numel() for parameter in parameters),
                 "loader": config["loader"],
+                "attention_backend": attention_backend,
+                "compile_pointwise": compile_pointwise,
                 "optimizers": {
                     name: {
                         "class": f"{type(optimizer).__module__}.{type(optimizer).__name__}",

@@ -61,6 +61,8 @@ launch.py train -> train.main
 
 普通训练update**不加载TE或VAE**；TE只在启动阶段（preview生效时）加载一次，训练循环里不再出现；preview也不加载TE、不搬动DiT，它复用启动时编码好的CPU embedding，只临时加载冻结VAE。加噪输入是`(1−σ)×latent+σ×noise`，DiT接收`1000σ`并预测`noise−latent`。训练数据、TE和基座DiT都不被optimizer改写。
 
+**attention与点算子**：训练循环（含反向重算与preview）跑在一个作用域里：把原生SDPA优先级设为cuDNN优先（`training.attention_backend`），并可选编译DiT的RMSNorm/SiTU/RoPE点算子（`training.compile_pointwise`，两项见第5节）。该作用域在preview的启动文本编码**之后**才进入，所以TE编码行为与`auto`/未编译时一致；两者都不改冻结基座权重、不替换适配器kernel，也不改变分桶、数据与步数。
+
 **train的stdout与`caption_stats`**：训练不再每step打印一行JSON——stdout是一条进度条（百分比、已处理/总step、step/s、已用时间/ETA）加当前loss、LR、显存和token范围；其余只有start/save/preview/finish/error这类生命周期行。`train.jsonl`仍每step写一条结构化记录，但字段`captions`/`empty_captions`已由固定形状的`caption_stats`取代：`count`是本step样本数，`levels`给出`plain`/`long`/`medium`/`short`各自计数（按dropout前的选中level归属），`dropped`是被`caption_dropout`换成空串的条数，`chars_min`/`chars_max`是最终文本的字符数极值，`tokens_min`/`tokens_max`是最终选中embedding的token数极值。一个step里的多个microbatch汇总时：`count`/`levels`/`dropped`相加，min取最小、max取最大。这些字段只含整数，不含caption原文，所以每step的文本元数据大小有界、不随caption长度增长；这不等于整个`train.jsonl`每行字节数恒定（`data_indices`、`buckets`、`batch_sizes`仍随batch变化），也没有在千万级记录上做过吞吐实测。preview生效时的启动文本编码只在`start`事件里留下数值`preview_text_encoding_seconds`与`preview_text_encoding_count`（未启用或周期全为0时都是0），同样不含提示词原文。
 
 ## 3. sample：重载保存的适配器，与基座出图对照
@@ -110,7 +112,7 @@ python launch.py train --config configs/plain_txt.json --cache-dir temp/new-cach
 python launch.py sample --config runs/new-run/config.json --adapter runs/new-run/adapter.safetensors --output-dir runs/new-run/comparison
 ```
 
-**resume**：`train --resume RUN/step000004.state.pt --output-dir NEW_RUN` 读取state中的配置、缓存路径、optimizer/scheduler、RNG和下一批位置，只跑原计划剩余步；不传`--config`，写新目录，恢复完整状态但不承诺CUDA逐bit一致。
+**resume**：`train --resume RUN/step000004.state.pt --output-dir NEW_RUN` 读取state中的配置、缓存路径、optimizer/scheduler、RNG和下一批位置，只跑原计划剩余步；不传`--config`，写新目录。恢复的是完整状态：数据游标（`data_indices`/桶/caption统计/下一批位置）、optimizer/scheduler与CPU/CUDA/噪声生成器RNG都与不中断的run一致，权重不逐bit复现（实测同一第38步的1260个适配器张量maxabs 1.9e-4）。`training.attention_backend`/`training.compile_pointwise`这类已解析的取值随state一起恢复；旧state里缺这两项时分别解析为`auto`/`false`。
 
 ## 5. 配置：默认值、具体行为、改动后果
 
@@ -227,6 +229,10 @@ Muon只接收`ndim==2`的参数，其余交给辅助AdamW；没有2D参数时只
 
 - **`training.max_grad_norm`** — 默认`1.0`，填正数。update前若全体adapter梯度范数为2，就整体缩到1再更新；不超过1则不缩。日志grad_norm是裁剪前值，0不是关闭开关；其他阈值未实测。
 
+- **`training.attention_backend`〔train〕** — 取值`cudnn`（默认）或`auto`。`cudnn`在训练循环（含反向重算与preview）内把原生SDPA优先级设为cuDNN→flash→efficient→math：能服务的形状优先走cuDNN，其余按序回退，不自己实现attention；`auto`完全不动torch的默认选择（stock）。本机Windows版torch的flash attention未编译（built false），stock挑到cutlass efficient内核，profile里attention是主要瓶颈，所以新run默认`cudnn`。**新run没写这项时解析为`cudnn`；resume旧state（其中配置没有这项）解析为`auto`**，让旧checkpoint按原来的内核选择继续；解析后的取值写进run的`config.json`与`state.pt`里的config，`train.jsonl`的`start`事件带`attention_backend`。作用域在preview的启动文本编码之后才开始，TE编码不受影响。cuDNN与stock是同一attention数学，但tiled reduction顺序不同，不是逐bit相同；`cudnn`需要torch暴露`sdpa_kernel(set_priority=...)`（torch 2.9+），否则显式报错。
+
+- **`training.compile_pointwise`〔train〕** — 默认`false`。`true`只编译DiT的点算子：`_RMSNorm`、SiTU、RoPE，用`dynamic=True`/`fullgraph=True`/`emulate_precision_casts=True`，即保持eager的BF16逐算子舍入；不做全模型compile、不替换LoRA/LoKr kernel，冻结基座与数据路径不变。开启要求：已安装的PyTorch暴露Inductor的`emulate_precision_casts`选项（实测2.14.0+cu130）、可用的Triton（Windows实测`triton-windows 3.8.0.post28`）与CUDA；缺任一项会在加载DiT前显式报错，不会静默退回eager。**resume旧state（其中配置没有这项）解析为`false`**；解析后的取值同样写进run的`config.json`与`state.pt`里的config，`train.jsonl`的`start`事件带`compile_pointwise`。编译缓存由`launch.py`统一放进仓库`temp/torchinductor-cache`与`temp/triton-cache`；Windows上若`CC`未设置，会先用Triton自带的TinyCC（`tcc.exe`）编译生成的kernel。RMSNorm按rank3/rank4 × 输入是否需要梯度的4个固定入口编译（不是按桶或形状生成入口），避免Dynamo按调用点无界重编译；生产 run 跑完全部289张图/26个桶未出现重编译溢出。`false`时完全不引入`torch.compile`，其他环境照常可跑，且仍保留`attention_backend`的cuDNN收益；改这项不需要新cache。保持eager的BF16逐算子舍入，不做精度降级，但reduction与梯度不保证逐bit一致；实测收益见README的实测表。
+
 ### save：train落盘，resume读取完整state
 
 - **`save.every_steps`** — 默认`200`；正整数表示每N次update保存，0关闭该周期。例如设4会写step000004、step000008的适配器文件；是否另有完整state由下项决定，最终adapter始终保存。
@@ -289,6 +295,8 @@ preview的文本embedding只存在于进程内：不写进`state.pt`/`config.jso
 ## 6. 预设文件
 
 - [`plain_txt.json`](configs/plain_txt.json)：纯文本caption基准——`caption_format="plain"`（同名`.txt`，缺失时用`dataset.caption`）、`resolutions=[1024]`、`bucket_step=16`、LoRA rank4/alpha4、Muon lr5e-4、`epochs=20`、`batch_size=1`+`gradient_accumulation=8`、每epoch保存state、preview `enabled=true`+`every_epochs=1`（832×1216）。
-- [`moss_official.json`](configs/moss_official.json)：`plain_txt.json`的官方caption版本——`caption_format="moss_official"`、`caption_dir=test_image_caption`、同名`.json`的long/medium/short三级全部进cache、每步等权抽一级；其余与`plain_txt.json`相同。
+- [`moss_official.json`](configs/moss_official.json)：`plain_txt.json`的官方caption版本——`caption_format="moss_official"`、`caption_dir=test_image_caption`、同名`.json`的long/medium/short三级全部进cache、每步等权抽一级；其余与`plain_txt.json`相同，另显式开启`training.attention_backend="cudnn"`与`training.compile_pointwise=true`（两项见第5节`training`小节与README的实测表）。
 - [`res768.json`](configs/res768.json)：`moss_official.json`的768档——只把`resolutions`改为`[768]`。
 - [`lokr_factor16.json`](configs/lokr_factor16.json)：`moss_official.json`的LoKr版本——`adapter.algo="lokr"`、`adapter.kwargs={"use_scalar":true,"factor":16}`；其余与`moss_official.json`相同。
+
+`res768.json`与`lokr_factor16.json`不写两个性能项：新run未写`attention_backend`时同样解析为`cudnn`，`compile_pointwise`取默认`false`（关掉pointwise编译仍保留cuDNN收益）。

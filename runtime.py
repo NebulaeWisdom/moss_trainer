@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import hashlib
+import inspect
 import json
 import logging
 import sys
@@ -24,6 +26,86 @@ from .data import cache_dataset
 from .vendor.pipeline_moss_image import MOSSImageTransformer
 
 logger = logging.getLogger(__name__)
+
+ATTENTION_BACKENDS = ("cudnn", "auto")
+
+
+def resolve_attention_backend(config: dict, *, resumed: bool) -> str:
+    """Resolve ``training.attention_backend`` in place and return the setting.
+
+    A new run defaults to cuDNN priority; a resumed run whose stored config
+    predates the setting keeps the runtime default so old checkpoints replay the
+    kernel choice they were trained with.
+    """
+    training = config["training"]
+    if "attention_backend" not in training:
+        training["attention_backend"] = "auto" if resumed else "cudnn"
+        logger.info(
+            "training.attention_backend not configured; resolved to %r for a %s run",
+            training["attention_backend"],
+            "resumed" if resumed else "new",
+        )
+    backend = training["attention_backend"]
+    if backend not in ATTENTION_BACKENDS:
+        raise ValueError(
+            f"training.attention_backend must be one of {ATTENTION_BACKENDS}, got {backend!r}"
+        )
+    return backend
+
+
+def resolve_compile_pointwise(config: dict) -> bool:
+    """Persist the opt-in compiler setting for both new and resumed runs."""
+    training = config["training"]
+    enabled = training.setdefault("compile_pointwise", False)
+    if type(enabled) is not bool:
+        raise ValueError(f"training.compile_pointwise must be a boolean, got {enabled!r}")
+    if enabled:
+        from .kernels import validate_pointwise_support
+
+        validate_pointwise_support()
+    logger.info("resolved training.compile_pointwise=%s", enabled)
+    return enabled
+
+
+@contextlib.contextmanager
+def training_kernels(config: dict) -> Iterator[None]:
+    """Scope attention priority and optional pointwise compilation to training.
+
+    The caller includes backward/recomputation and DiT previews, but excludes
+    text-encoder loading/encoding. All patched functions and backend priorities
+    are restored on exit, including when training raises.
+    """
+    backend = config["training"]["attention_backend"]
+    if backend not in ATTENTION_BACKENDS:
+        raise ValueError(
+            f"training.attention_backend must be one of {ATTENTION_BACKENDS}, got {backend!r}"
+        )
+    compile_pointwise = config["training"].get("compile_pointwise", False)
+    if type(compile_pointwise) is not bool:
+        raise ValueError(
+            f"training.compile_pointwise must be a boolean, got {compile_pointwise!r}"
+        )
+    with contextlib.ExitStack() as stack:
+        if backend == "cudnn":
+            # Refuse rather than guess a fallback on older torch releases.
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+
+            if "set_priority" not in inspect.signature(sdpa_kernel).parameters:
+                raise RuntimeError(
+                    "training.attention_backend='cudnn' requires torch.nn.attention.sdpa_kernel(set_priority=True)"
+                )
+            backends = [
+                SDPBackend.CUDNN_ATTENTION,
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ]
+            stack.enter_context(sdpa_kernel(backends, set_priority=True))
+        if compile_pointwise:
+            from .kernels import pointwise_kernels
+
+            stack.enter_context(pointwise_kernels())
+        yield
 
 
 def load_dit(config: dict, checkpointing: bool = False) -> MOSSImageTransformer:

@@ -52,14 +52,17 @@ from diffusers.pipelines.pipeline_utils import ImagePipelineOutput
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import AutoModel, AutoTokenizer
 
+def _rms_norm(x, weight):
+    y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+    return y.to(x.dtype) * weight
+
 class _RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
-        return y.to(x.dtype) * self.weight
+        return _rms_norm(x, self.weight)
 
 def _situ(hidden, gate):
     return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (25.0 * torch.tanh(hidden / 25.0))

@@ -48,7 +48,7 @@ launch.py train -> train.main
        caption_dropout：选原句，或选已缓存的空字符串 -> 记录选中level与是否被换成空串
        （moss_official先按caption_weights抽long/medium/short一级）
   -> latent做2×2重排和BN归一化 -> 加噪声 -> DiT前向
-  -> rectified-flow MSE -> backward -> 梯度累积/裁剪 -> optimizer.step
+  -> rectified-flow MSE（按窗口实际样本数加权）-> backward -> 梯度累积/裁剪 -> optimizer.step
   -> scheduler.step -> 写train.jsonl + 刷新stdout进度条 -> 按周期保存 / 可选preview -> 下一批
 ```
 
@@ -63,7 +63,7 @@ launch.py train -> train.main
 
 **attention与点算子**：训练循环（含反向重算与preview）跑在一个作用域里：把原生SDPA优先级设为cuDNN优先（`training.attention_backend`），并可选编译DiT的RMSNorm/SiTU/RoPE点算子（`training.compile_pointwise`，两项见第5节）。该作用域在preview的启动文本编码**之后**才进入，所以TE编码行为与`auto`/未编译时一致；两者都不改冻结基座权重、不替换适配器kernel，也不改变分桶、数据与步数。
 
-**train的stdout与`caption_stats`**：训练不再每step打印一行JSON——stdout是一条进度条（百分比、已处理/总step、step/s、已用时间/ETA）加当前loss、LR、显存和token范围；其余只有start/save/preview/finish/error这类生命周期行。`train.jsonl`仍每step写一条结构化记录，但字段`captions`/`empty_captions`已由固定形状的`caption_stats`取代：`count`是本step样本数，`levels`给出`plain`/`long`/`medium`/`short`各自计数（按dropout前的选中level归属），`dropped`是被`caption_dropout`换成空串的条数，`chars_min`/`chars_max`是最终文本的字符数极值，`tokens_min`/`tokens_max`是最终选中embedding的token数极值。一个step里的多个microbatch汇总时：`count`/`levels`/`dropped`相加，min取最小、max取最大。这些字段只含整数，不含caption原文，所以每step的文本元数据大小有界、不随caption长度增长；这不等于整个`train.jsonl`每行字节数恒定（`data_indices`、`buckets`、`batch_sizes`仍随batch变化），也没有在千万级记录上做过吞吐实测。preview生效时的启动文本编码只在`start`事件里留下数值`preview_text_encoding_seconds`与`preview_text_encoding_count`（未启用或周期全为0时都是0），同样不含提示词原文。
+**train的stdout与`caption_stats`**：训练不再每step打印一行JSON——stdout是一条进度条（百分比、已处理/总step、step/s、已用时间/ETA）加当前loss、LR、显存和token范围；其余只有start/save/preview/finish/error这类生命周期行。`train.jsonl`仍每step写一条结构化记录，但字段`captions`/`empty_captions`已由固定形状的`caption_stats`取代：`count`是本step样本数，`levels`给出`plain`/`long`/`medium`/`short`各自计数（按dropout前的选中level归属），`dropped`是被`caption_dropout`换成空串的条数，`chars_min`/`chars_max`是最终文本的字符数极值，`tokens_min`/`tokens_max`是最终选中embedding的token数极值。一个step里的多个microbatch汇总时：`count`/`levels`/`dropped`相加，min取最小、max取最大。这些字段只含整数，不含caption原文，所以每step的文本元数据大小有界、不随caption长度增长；这不等于整个`train.jsonl`每行字节数恒定（`data_indices`、`buckets`、`batch_sizes`、`sample_count`仍随batch变化），也没有在千万级记录上做过吞吐实测。每个step记录另带`sample_count`（该窗口实际样本数，等于`batch_sizes`之和）、`batch_sizes`（每个microbatch的图片数）与`microbatch_count`（窗口内批次数）：`batch_size×gradient_accumulation`只是样本数上界，桶尾批更小（见第5节training）。preview生效时的启动文本编码只在`start`事件里留下数值`preview_text_encoding_seconds`与`preview_text_encoding_count`（未启用或周期全为0时都是0），同样不含提示词原文。
 
 ## 3. sample：重载保存的适配器，与基座出图对照
 
@@ -112,7 +112,7 @@ python launch.py train --config configs/plain_txt.json --cache-dir temp/new-cach
 python launch.py sample --config runs/new-run/config.json --adapter runs/new-run/adapter.safetensors --output-dir runs/new-run/comparison
 ```
 
-**resume**：`train --resume RUN/step000004.state.pt --output-dir NEW_RUN` 读取state中的配置、缓存路径、optimizer/scheduler、RNG和下一批位置，只跑原计划剩余步；不传`--config`，写新目录。恢复的是完整状态：数据游标（`data_indices`/桶/caption统计/下一批位置）、optimizer/scheduler与CPU/CUDA/噪声生成器RNG都与不中断的run一致，权重不逐bit复现（实测同一第38步的1260个适配器张量maxabs 1.9e-4）。`training.attention_backend`/`training.compile_pointwise`这类已解析的取值随state一起恢复；旧state里缺这两项时分别解析为`auto`/`false`。
+**resume**：`train --resume RUN/step000004.state.pt --output-dir NEW_RUN` 读取state中的配置、缓存路径、optimizer/scheduler、RNG和下一批位置，只跑原计划剩余步；不传`--config`，写新目录。恢复的是完整状态：数据游标（`data_indices`/桶/caption统计/下一批位置）、optimizer/scheduler与CPU/CUDA/噪声生成器RNG都与不中断的run一致，权重不逐bit复现（实测同一第38步的1260个适配器张量maxabs 1.9e-4）。`training.attention_backend`/`training.compile_pointwise`这类已解析的取值随state一起恢复；旧state里缺这两项时分别解析为`auto`/`false`。`training.checkpoint_group_size`同样随state恢复，旧state缺这项时解析为`1`。**累积口径变化**：现在每个样本在窗口内权重相同（见第5节），旧state的`batch_size=1`窗口数学不变、可继续；旧`batch_size>1`的state会在新口径下续跑，窗口内含不等大小批（桶尾）时轨迹不与旧的mean-of-batch-means逐bit一致，没有legacy开关或兼容层。
 
 ## 5. 配置：默认值、具体行为、改动后果
 
@@ -213,13 +213,15 @@ Muon只接收`ndim==2`的参数，其余交给辅助AdamW；没有2D参数时只
 
 - **`training.epochs`** — 默认`null`，填正整数或`null`。一次epoch读完缓存records×repeats；例如578条、batch1、累积1，epochs2代表1156次更新，但同时max_steps600就先在600停。至少与max_steps之一非null；epoch-only停止未实测。
 
-- **`training.batch_size`** — 默认`1`，填正整数。只把同宽高桶的图片stack进一批；设2会同时前向两张、占更多显存、减少每epoch批次数，桶尾剩1张也保留。大于1未实测。
+- **`training.batch_size`** — 默认`1`，填正整数。只把同宽高桶的图片stack进一批；设2会同时前向两张、占更多显存、减少每epoch批次数，桶尾剩1张也保留。bs2/bs3已按生产口径跑完整289图/26桶一个epoch：吞吐没有实质收益（bs2/bs3的`s/sample`比bs1慢0.67%/1.10%），容量可行（详见README的16GB实测表）。
 
-- **`training.gradient_accumulation`** — 默认`1`，填正整数。设4时先对4批分别backward累积梯度，再clip/step一次；epoch尾只剩2批时除以2并更新，不跨epoch凑4。578批因此是145次更新，最后一次2批；大于1/尾批边界未实测。
+- **`training.gradient_accumulation`** — 默认`1`，填正整数。设4时先对4批分别backward累积梯度，再clip/step一次；epoch尾只剩2批时按该窗口的实际样本数归一（`batch_size=1`时即除以2）并更新，不跨epoch凑4。578批因此是145次更新，最后一次2批；`accumulation`为8/12/24且带桶尾的边界已在bs1/bs2/bs3完整epoch复测里覆盖（每step的实际样本数见`sample_count`）。窗口的加权口径见本小节末。
 
 - **`training.seed`** — 默认`42`，填整数。控制adapter初始化、batch打乱、噪声/时间步；改43开新训练会换这些随机数，但图片crop仍来自已有cache。resume恢复保存的RNG，不从42重新开始。
 
 - **`training.gradient_checkpointing`** — 默认`true`，填布尔。true不保存全部block中间激活，反向时重算以省显存；false少重算但需要保留更多激活。不是保存`.state.pt`的开关，false未实测。
+
+- **`training.checkpoint_group_size`〔train〕** — 默认`1`，填正整数；只在`gradient_checkpointing=true`时改变计算（false时不走重算路径，但取值仍会被校验并写进run配置/state）。`1`是原来的行为：42个主block各自一个checkpoint；`2`表示每2个**相邻的激活block**合成一组、每组一个checkpoint（`skip_layers`先排除，再按激活block的索引顺序切分，例如`skip_layers=(1,)`时按`0,2,3,4,…`的激活顺序成组）。分组只决定“保留哪些中间激活、反向时重算哪些”：前向/反向/重算的数学与adapter dropout的RNG消耗顺序都不变，输出与梯度与逐block checkpoint一致（CPU与CUDA用例逐张量比对，梯度容差rtol 1e-6/atol 1e-7；含`skip_layers`与dropout 0/0.1），`no_grad`/`inference_mode`下输出也一致。**组越大不等于越好**：组内保留的激活更少，但反向重算时要同时驻留的live set更大，显存峰值与重算量都随组大小变化，必须按实测选择，不能假定更大组总是更省或更快。只作用于42个主block，`text_embedder`仍按原来的逐block checkpoint；adapter、冻结权重、数据与步数都不变，改这项不需要新cache。非法值（布尔、`0`、负数、非整数）在加载模型前报错；`train.jsonl`的`start`事件、run的`config.json`/`state.pt`与启动行都带`checkpoint_group_size`，resume旧state（配置里没有这项）解析为`1`。
 
 - **`training.timestep_sampling`** — 默认`uniform`，可选`uniform`/`logit_normal`。前者均匀采0～1的σ，后者正态采样后经sigmoid；σ=0.9的输入主要是噪声，σ=0.1主要保留图片latent。后者可调整两类阶段的出现频率，未实测。
 
@@ -232,6 +234,25 @@ Muon只接收`ndim==2`的参数，其余交给辅助AdamW；没有2D参数时只
 - **`training.attention_backend`〔train〕** — 取值`cudnn`（默认）或`auto`。`cudnn`在训练循环（含反向重算与preview）内把原生SDPA优先级设为cuDNN→flash→efficient→math：能服务的形状优先走cuDNN，其余按序回退，不自己实现attention；`auto`完全不动torch的默认选择（stock）。本机Windows版torch的flash attention未编译（built false），stock挑到cutlass efficient内核，profile里attention是主要瓶颈，所以新run默认`cudnn`。**新run没写这项时解析为`cudnn`；resume旧state（其中配置没有这项）解析为`auto`**，让旧checkpoint按原来的内核选择继续；解析后的取值写进run的`config.json`与`state.pt`里的config，`train.jsonl`的`start`事件带`attention_backend`。作用域在preview的启动文本编码之后才开始，TE编码不受影响。cuDNN与stock是同一attention数学，但tiled reduction顺序不同，不是逐bit相同；`cudnn`需要torch暴露`sdpa_kernel(set_priority=...)`（torch 2.9+），否则显式报错。
 
 - **`training.compile_pointwise`〔train〕** — 默认`false`。`true`只编译DiT的点算子：`_RMSNorm`、SiTU、RoPE，用`dynamic=True`/`fullgraph=True`/`emulate_precision_casts=True`，即保持eager的BF16逐算子舍入；不做全模型compile、不替换LoRA/LoKr kernel，冻结基座与数据路径不变。开启要求：已安装的PyTorch暴露Inductor的`emulate_precision_casts`选项（实测2.14.0+cu130）、可用的Triton（Windows实测`triton-windows 3.8.0.post28`）与CUDA；缺任一项会在加载DiT前显式报错，不会静默退回eager。**resume旧state（其中配置没有这项）解析为`false`**；解析后的取值同样写进run的`config.json`与`state.pt`里的config，`train.jsonl`的`start`事件带`compile_pointwise`。编译缓存由`launch.py`统一放进仓库`temp/torchinductor-cache`与`temp/triton-cache`；Windows上若`CC`未设置，会先用Triton自带的TinyCC（`tcc.exe`）编译生成的kernel。RMSNorm按rank3/rank4 × 输入是否需要梯度的4个固定入口编译（不是按桶或形状生成入口），避免Dynamo按调用点无界重编译；生产 run 跑完全部289张图/26个桶未出现重编译溢出。`false`时完全不引入`torch.compile`，其他环境照常可跑，且仍保留`attention_backend`的cuDNN收益；改这项不需要新cache。保持eager的BF16逐算子舍入，不做精度降级，但reduction与梯度不保证逐bit一致；实测收益见README的实测表。
+
+**按样本加权的累积loss**：一个update的loss是`Σ(microbatch_mean × actual_batch_size) / window_samples`，即窗口内每个样本的权重都是`1/window_samples`（`window_samples`由sampler按批次计划直接算出，不读取被跳过的数据）。一批只含同一个桶（同宽高）的图片，所以该批的元素均值等于批内每样本均值的平均，加权后窗口loss正好是“每样本均值”的平均。`batch_size=1`时`window_samples`等于microbatch数，数学与旧实现完全相同，旧结果与本文档继续有效；旧实现`batch_size>1`且窗口内含不等大小批（桶尾）时用mean-of-batch-means，小批里的样本被高估权重，现在改为每样本等权（resume兼容性见第4节）。
+
+**原生前向仍逐样本**：vendor的DiT `forward`按batch维逐样本循环（每个样本单独跑42个block、单独拼图像与文本token），所以`batch_size>1`不会自动把单样本内部的计算并行化，只是把多个样本串进同一个update。本地另有一个把样本合并成masked batched forward的向量化原型（工作区根目录`temp/train-batch-opt/vectorized_candidate.py`，即`../temp/...`，本地实验、不入库），它**不是生产路径**，发布代码始终走原生逐样本前向。该原型已弃用：`bs3`+offload超出WDDM上限（reserved 17.777GiB），BF16下LoKr的2/1080项比较超出预设容差（FP32结构诊断全过），`bs2`向量路径未测。
+
+**显存容量口径（Windows）**：判断“装得下”不能只看一个数。`torch.cuda.memory_allocated`/`memory_reserved`只是PyTorch分配器视角，`nvidia-smi`的`memory.used`是设备视角；WDDM下还要看进程级`\GPU Process Memory(*)\Dedicated Usage`与`Shared Usage`，并同时满足dedicated仍有剩余余量、allocator retries/OOM为0。**shared增长本身不等于溢出**：`loader.pin_memory=true`（预设默认，也是生产口径）时CUDA的页锁定主机缓冲就计入shared，属正常现象，这部分增量应与`torch.cuda.host_memory_stats()`的registered/cached pinned pool对得上（增量不超过该pool）；只有**未被pinned pool解释的大额shared增长**才是WDDM把设备内存换到系统内存的风险信号，不能因为shared一涨就断言spill。反过来，**没有OOM也不等于激活都常驻显存**：要把dedicated余量、allocator retries/OOM、shared的构成三项一起看才算“装得下”。对照时固定`loader.pin_memory=true`；`pin_memory=false`只作为附录对照，不是生产设置，也不改生产配置。本次三行完整epoch复测在1Hz PDH下未观察到超出pinned池的shared增长（60/114/174MiB vs 池峰值61.255/115.009/174.514MiB），allocator retries/OOM都是0，训练进程dedicated峰值14121.5/14121.6/14121.8MiB仍留有余量；结合这三点，容量结论不依赖WDDM spill（数值与口径见README「batch、梯度累积与显存口径（16GB 实测）」）。显式CPU offload（把checkpoint激活用`save_on_cpu`钩子搬到CPU）只在本地实验里评估过，没有进入发布代码、也没有配置项，并且**绝不进入无offload的容量口径**（搬移量与trace摘要见README「已评估但未采用」）；发布代码提供的显存手段只有`training.gradient_checkpointing`与`training.checkpoint_group_size`。
+
+**显存分配器（可选，显式opt-in）**：想试PyTorch的`expandable_segments`，在启动train前显式设环境变量（PowerShell）：
+
+```powershell
+$env:PYTORCH_ALLOC_CONF = 'expandable_segments:True'
+python launch.py train --config configs/moss_official.json --cache-dir temp/my-cache --output-dir runs/my-run
+```
+
+它只改CUDA caching allocator的段管理，不改训练数学、数据、步数与任何配置项；本机torch 2.14.0+cu130/Windows实测支持该选项，旧torch或其他平台不保证。默认不启用：`launch.py`、配置与`requirements.txt`都不设它，也不会替你打开；本机torch先读旧名`PYTORCH_CUDA_ALLOC_CONF`、只在旧名未设置时才读`PYTORCH_ALLOC_CONF`，所以显式设新名不会覆盖你已有的旧名设置。本次batch/容量复测就是在显式opt-in下跑的。
+
+**改batch/累积时的建议**：桶内成批，所以`batch_size`只对同桶图片生效，桶尾批更小；`batch_size × gradient_accumulation`只是每update样本数的上界，实际样本数看每step记录的`sample_count`。想在不改每update名义样本数的情况下试更大batch，可以写`batch_size=2, gradient_accumulation=4`（名义8，与预设的`1×8`对齐）；做等样本数对照可用`1×24`/`2×12`/`3×8`（名义都是24）。这些只是**名义样本数对齐**，不是质量等价。这套数据上的完整实测（吞吐、allocated/reserved、nvidia与shared/pinned口径、完整epoch）见README「batch、梯度累积与显存口径（16GB 实测）」：`group2`+`pin_memory=true`+显式`expandable_segments`、无offload下三行都跑完一个epoch，bs2/bs3的`s/sample`比bs1慢0.67%/1.10%，容量均无retries/OOM、也未观察到超出pinned池的shared增长；该结论只限这套数据（不推广到其他数据集、长文本或别的rank），官方四个预设仍保持`batch_size=1`+`gradient_accumulation=8`+默认`checkpoint_group_size=1`。
+
+**成本与显存贡献（生产口径，数值见README）**：当前生产配置（`group2`+cuDNN+pointwise编译+`expandable_segments`，`bs1`/`acc8`）的一次CUDA trace里kernel总计2201.268ms：GEMM 59.1%、attention 24.1%、eager elementwise 11.8%、compiled pointwise 4.2%、copy/cast/cat 0.8%，GPU活动占96.49%——只说明主要device成本与host不是主瓶颈，不说backend最优、也不说没有优化空间；该trace的step墙钟被CUPTI额外约6.16s污染，吞吐一律用README的resident主表。显存贡献（`bs3`×`acc8`前3个update，只报torch `allocated`/`reserved`，该早期消融未采PDH）：`group1→group2`的warm峰值`allocated` 13.533→12.436GiB（省1123MiB）；`group2`再加`expandable_segments`的warm峰值`reserved` 14.258→13.025GiB（省1263MiB）、同期`allocated`近似不变——两个数不能相加成“总节省”。`group2`的BF16等价性实跑（生产kernel作用域，小模型helper）726项输出/loss/梯度比较全为0（`batch_size`2/3、`skip_layers`[]/[1]、含LoRA dropout0.1与LoKr factor16+scalar），unit用例23项CPU/CUDA通过；不是5B全模型长跑，也不构成质量结论。
 
 ### save：train落盘，resume读取完整state
 
@@ -255,7 +276,7 @@ preview的文本embedding只存在于进程内：不写进`state.pt`/`config.jso
 
 - **`loader.num_workers`** — 默认`2`，填非负整数。2表示两个CPU进程并行读latent/embedding并组批，0则主进程读取；不让两个worker各加载一套TE/VAE。加worker可能减少等盘时间，也增加启动/RAM副本，其他数量未实测。
 
-- **`loader.pin_memory`** — 默认`true`。把已组好的CPU batch放页锁定内存，以便non_blocking传GPU；不是把全部图片放显存。false少占页锁定内存但可能增加传输等待，未实测。
+- **`loader.pin_memory`** — 默认`true`。把已组好的CPU batch放页锁定内存，以便non_blocking传GPU；不是把全部图片放显存。false少占页锁定内存但可能增加传输等待，未实测。**pinned主机缓冲在Windows会计入进程的shared GPU内存**（见第5节training的容量口径），所以显存对照固定用默认`true`，`false`只作附录。
 
 - **`loader.prefetch_factor`** — 默认`2`，填正整数。每worker提前准备N批，workers2×prefetch2约4批在途；改4可缓冲更长I/O波动但约翻倍预取内存，不加快DiT计算。worker0时不用；其他值未实测。
 
@@ -299,4 +320,4 @@ preview的文本embedding只存在于进程内：不写进`state.pt`/`config.jso
 - [`res768.json`](configs/res768.json)：`moss_official.json`的768档——只把`resolutions`改为`[768]`。
 - [`lokr_factor16.json`](configs/lokr_factor16.json)：`moss_official.json`的LoKr版本——`adapter.algo="lokr"`、`adapter.kwargs={"use_scalar":true,"factor":16}`；其余与`moss_official.json`相同。
 
-四个预设都显式写`training.attention_backend="cudnn"`与`training.compile_pointwise=true`（两项见第5节`training`小节与README的实测表）；新run未写`attention_backend`时解析为`cudnn`，未写`compile_pointwise`时取默认`false`。
+四个预设都显式写`training.attention_backend="cudnn"`与`training.compile_pointwise=true`（两项见第5节`training`小节与README的实测表）；新run未写`attention_backend`时解析为`cudnn`，未写`compile_pointwise`时取默认`false`。四个预设也都保持`batch_size=1`+`gradient_accumulation=8`，且都不写`training.checkpoint_group_size`（取默认`1`）：复测显示bs2/bs3没有实质吞吐收益（见README的16GB实测表），所以预设不改；要试分组或更大batch，请复制预设到自己新建的配置里再改。

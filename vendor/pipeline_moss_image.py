@@ -42,6 +42,7 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 from diffusers import AutoencoderKLFlux2, DiffusionPipeline, FlowMatchEulerDiscreteScheduler
 from diffusers.schedulers.scheduling_utils import SchedulerMixin  # Required by custom-component discovery.
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -111,11 +112,15 @@ class _TextProjection(nn.Module):
         super().__init__()
         self.proj = nn.Linear(text_dim, dim)
         self.blocks = nn.ModuleList([_TextBlock(dim, ffn_dim, heads) for _ in range(2)])
+        self._checkpointing = False
 
     def forward(self, x, rope):
         x = self.proj(x.to(self.proj.weight.dtype))
         for block in self.blocks:
-            x = block(x, rope)
+            if self._checkpointing and torch.is_grad_enabled():
+                x = checkpoint(block, x, rope, use_reentrant=False, preserve_rng_state=True)
+            else:
+                x = block(x, rope)
         return x
 
 class _Block(nn.Module):
@@ -200,6 +205,40 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
         self.final_norm_video = _RMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
+        self._checkpointing = False
+        self._checkpoint_group_size = 1
+        self._checkpoint_groups = tuple((index,) for index in range(num_layers))
+
+    def _configure_checkpointing(self, enabled, group_size=1):
+        self._checkpointing = enabled
+        self._checkpoint_group_size = group_size
+        self._checkpoint_groups = self._make_checkpoint_groups(())
+        # Keep the original per-block text checkpoints, including frozen inputs.
+        self.text_embedder._checkpointing = enabled
+
+    def _make_checkpoint_groups(self, skip_layers):
+        indices = tuple(index for index in range(len(self.layers)) if index not in skip_layers)
+        size = self._checkpoint_group_size
+        return tuple(indices[start:start + size] for start in range(0, len(indices), size))
+
+    def _run_layer_group(self, x, rope, modulation, indices):
+        for index in indices:
+            x = self.layers[index](x, rope, modulation)
+        return x
+
+    def _run_layers(self, x, rope, modulation, skip_layers):
+        if not self._checkpointing or not torch.is_grad_enabled():
+            for index, layer in enumerate(self.layers):
+                if index not in skip_layers:
+                    x = layer(x, rope, modulation)
+            return x
+        groups = self._make_checkpoint_groups(skip_layers) if skip_layers else self._checkpoint_groups
+        for indices in groups:
+            # Immutable indices are checkpoint inputs, not late-bound closures.
+            # Nonreentrant checkpointing also trains adapters when x is frozen.
+            x = checkpoint(self._run_layer_group, x, rope, modulation, indices,
+                           use_reentrant=False, preserve_rng_state=True)
+        return x
 
     def load_training_state_dict(self, state_dict, *, prefix=''):
         """Load a consolidated raw/EMA model mapping, strictly; no silent key drops."""
@@ -243,9 +282,7 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
             rope = self.rope(height, width, context.shape[1], hidden_states.device).to(video.dtype)
             text = self.text_embedder(context, rope[:, height * width:])
             x = torch.cat((video, text), 1)
-            for layer_index, layer in enumerate(self.layers):
-                if layer_index not in skip_layers:
-                    x = layer(x, rope, mod[index:index + 1])
+            x = self._run_layers(x, rope, mod[index:index + 1], skip_layers)
             x = self.final_norm_video(x[:, :height * width].to(self.final_norm_video.weight.dtype))
             x = x * (1 + head[index:index + 1, 1, None]) + head[index:index + 1, 0, None]
             x = self.final_linear_video(x.to(self.final_linear_video.weight.dtype))

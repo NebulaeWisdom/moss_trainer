@@ -12,13 +12,11 @@ import logging
 import sys
 import time
 from collections.abc import Iterator
-from functools import partial
 from pathlib import Path
 
 import torch
 from diffusers import AutoencoderKLFlux2
 from safetensors.torch import save_file
-from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
@@ -67,6 +65,17 @@ def resolve_compile_pointwise(config: dict) -> bool:
     return enabled
 
 
+def resolve_checkpoint_group_size(config: dict) -> int:
+    """Persist group one for new runs and stored configs predating grouping."""
+    training = config["training"]
+    group_size = training.setdefault("checkpoint_group_size", 1)
+    if type(group_size) is not int or group_size < 1:
+        raise ValueError(
+            f"training.checkpoint_group_size must be a positive integer, got {group_size!r}"
+        )
+    return group_size
+
+
 @contextlib.contextmanager
 def training_kernels(config: dict) -> Iterator[None]:
     """Scope attention priority and optional pointwise compilation to training.
@@ -110,6 +119,7 @@ def training_kernels(config: dict) -> Iterator[None]:
 
 def load_dit(config: dict, checkpointing: bool = False) -> MOSSImageTransformer:
     """Load the frozen BF16 DiT; the training caller explicitly selects train mode."""
+    group_size = resolve_checkpoint_group_size(config)
     dit = MOSSImageTransformer.from_pretrained(
         Path(config["model_dir"]) / "transformer",
         torch_dtype=torch.bfloat16,
@@ -118,10 +128,7 @@ def load_dit(config: dict, checkpointing: bool = False) -> MOSSImageTransformer:
     dit.requires_grad_(False)
     dit.eval()
     dit.to("cuda")
-    if checkpointing:
-        # Capture each original bound method without changing module names/classes.
-        for block in (*dit.layers, *dit.text_embedder.blocks):
-            block.forward = partial(checkpoint, block.forward, use_reentrant=False)
+    dit._configure_checkpointing(checkpointing, group_size)
     return dit
 
 

@@ -116,6 +116,75 @@ venv/Scripts/python.exe -B -m unittest discover -s moss_trainer/tests -p test_tr
 
 LyCORIS 的 triton 后端在 cuDNN 下 step2–4 median 22.666s vs 22.838s，同索引对比仅约 0.75%，落在运行间波动内，不构成收益；训练继续用 torch 后端。
 
+**向量化前向原型（未采用）**：把vendor的逐样本循环改成masked batched forward的本地原型（工作区根目录`temp/train-batch-opt/vectorized_candidate.py`，即`../temp/...`，不入库）：`bs3`+offload实测超出WDDM上限（reserved 17.777GiB），弃用；BF16下LoKr的2/1080项比较超出预设容差（同一配置的FP32结构诊断全部通过），因此不纳入生产。没有测过`bs2`的向量路径，也不做质量等价推断。
+
+**显式CPU offload（未采用）**：把checkpoint激活用`save_on_cpu`钩子搬到CPU的本地实验（`group1`+offload+`expandable_segments`，实验性13.5GiB allocator上限）。step2的8个microbatch/24样本里每个方向搬27,417,933,312B（25.535GiB）、3024次copy调用；纯拷贝H2D 957.194ms（还多含98,854,681B输入传输）、D2H 961.120ms（多112B），合计1.918314s，**已包含在前向/反向的阶段时间里**，不是在step外额外叠加；hook的CUDA event区间988.019/995.572ms含launch/host间隙，不能当纯拷贝耗时。该run里pinned池4.295GiB、PDH shared 82→4480MiB（+4398由该池解释）；torch峰值`allocated` 10.484GiB/`reserved` 11.053GiB，设备峰12631MiB，allocator retries/OOM为0。无profiler的配对前缀实跑（同`data_indices`顺序、前3个update共68样本）：`group2`无offload 161.220262s（2.370886 s/sample，warm 2.284373）vs `group1`+CPU offload 167.791281s（2.467519，warm 2.376396），本短对照慢4.08%——但它比的是两种checkpoint策略（group数不同），不是offload单因素A/B，**不外推**这个比例（该实跑仍带轻量的hook字节/CUDA event计数，只是没开`torch.profiler`）。每个update约54.84GB双向搬运、pinned池4.295GiB，未带来吞吐收益，所以这是**显式CPU offload**、不纳入生产，也绝不进入上面无offload的容量主表。原始：工作区根目录`temp/train-batch-opt/offload-transfer-summary.json`（即`../temp/...`）。
+
+## batch、梯度累积与显存口径（16GB 实测）
+
+**复测口径**：289图/26桶/seed42/1024档/冻结BF16基座/FP32 LoRA rank4/Muon 5e-4；`checkpoint_group_size=2`、`loader.pin_memory=true`、显式`expandable_segments`、无CPU offload、无allocator上限；跑完整1个epoch（含该epoch的保存state与preview）。三行的batch计划不同、update数也不同，**名义样本数相同不等于质量等价**；`s/sample`=Σ`step_seconds`/289。原始记录在**工作区根目录**`temp/train-batch-opt/resident-matrix-results.json`（从仓库`moss_trainer/`出发即`../temp/train-batch-opt/...`；本地git-ignored测量产物，不随仓库提交）与各run的`train.jsonl`/显存采样JSONL。复现只需用原config改`batch_size`/`gradient_accumulation`/`checkpoint_group_size=2`并加allocator环境变量，cache仍在仓库`temp/new-cache`。
+
+| 配置 | updates / microbatches | Σ step_seconds | s/sample | 相对 bs1 | epoch_loop | 全命令 |
+|---|---|---|---|---|---|---|
+| `bs1 × acc24` | 13 / 289 | 655.484s | 2.2681 | 1.000× | 681.909s | 703.610s |
+| `bs2 × acc12` | 13 / 153 | 659.892s | 2.2834 | 0.993×（−0.67%） | 687.048s | 710.469s |
+| `bs3 × acc8` | 14 / 107 | 662.718s | 2.2931 | 0.989×（−1.10%） | 689.120s | 711.094s |
+
+`epoch_loop`是完整一个epoch的训练循环（含该epoch的保存与preview）；`全命令`是整个进程的墙钟（含加载TE等启动开销）。三行的真实样本数都是289个唯一索引、26个桶，caption分布一致（long 106/medium 99/short 84）。
+
+| 配置 | 峰值 allocated（GiB，冷/暖） | 峰值 reserved（GiB） | 训练进程 dedicated 峰值（MiB） | 训练时段设备峰值（MiB） | 全命令时段设备峰值（MiB） | shared 增长 / pinned 池峰值（MiB） | retries / OOM |
+|---|---|---|---|---|---|---|---|
+| `bs1 × acc24` | 11.688 / 11.426 | 11.896 | 14121.531 | 13216 | 14732 | 60 / 61.255 | 0 / 0 |
+| `bs2 × acc12` | 12.229 / 11.960 | 12.479 | 14121.637 | 14022 | 14973 | 114 / 115.009 | 0 / 0 |
+| `bs3 × acc8` | 12.762 / 12.468 | 13.025 | 14121.754 | 14650 | 14999 | 174 / 174.514 | 0 / 0 |
+
+`allocated`/`reserved`是torch分配器口径（GiB）。`训练进程 dedicated 峰值`是PDH `\GPU Process Memory(*)\Dedicated Usage`在整个run内的峰值（preview主导）。`训练时段/全命令时段设备峰值`是nvidia-smi的1Hz采样：分别是训练循环期间与整个进程期间的**设备整体**dedicated使用量，**含桌面与其他GPU进程，不是本训练进程的峰值**。两套单位不混用。
+
+- **吞吐结论**：bs2/bs3相对bs1没有实质收益——`s/sample`分别慢0.67%/1.10%。这与“原生前向仍逐样本”一致（见下）：batch>1只把多个样本串进同一个update，不提高单样本内部的并行度。
+- **容量结论**：同一套生产口径下，bs1/bs2/bs3都跑完了完整289图/26桶一个epoch：1Hz PDH未观察到超出pinned池的shared增长（60/114/174MiB vs 池峰值61.255/115.009/174.514MiB），训练进程dedicated峰值14121.531/14121.637/14121.754MiB（preview主导）仍留有余量，allocator retries与OOM都是0——结合这三点，结论**不依赖WDDM spill**。设备整体口径（含桌面与其他GPU进程）在训练时段峰值13216/14022/14650MiB、全命令时段峰值14732/14973/14999MiB（均为1Hz采样）。
+- **边界**：以上只覆盖这一套数据（289图/26桶/1024档/rank4 LoRA/seed42/单epoch，`group2`+显式`expandable_segments`），不推广到其他数据集、更长的文本或别的rank。分组与allocator的显存消融见本节末「显存贡献」，分组等价性见「分组的等价性实跑」，当前生产配置的kernel构成见「kernel 成本构成」。
+- 官方四个预设保持`batch_size=1`+`gradient_accumulation=8`+默认`checkpoint_group_size=1`，本次复测不改预设。
+
+下面是选项的行为与改配置方式。
+
+- **`training.checkpoint_group_size`**（默认`1`，正整数；只在`training.gradient_checkpointing=true`时改变计算）：`1`是原来的行为——42个主block各自一个checkpoint；`2`把2个**相邻的激活block**合成一组、每组一个checkpoint（`skip_layers`先排除，再按激活block的索引顺序切分）。分组只改变“保留哪些中间激活、反向时重算哪些”：前向/反向/重算的数学与adapter dropout的RNG消耗顺序都不变，输出与梯度与逐block checkpoint一致（CPU与CUDA用例逐张量比对，含`skip_layers`与dropout）。组内保留的激活更少，但反向重算时要同时驻留的live set更大，**不能假定组越大越省或越快**，要按实测选。只作用于主block，`text_embedder`仍按逐block checkpoint；四个预设都不写这项（默认`1`）。本次复测三行都用`group_size=2`，分组自身的单变量消融只到`1→2`且只报torch allocated/reserved（见本节末「显存贡献」）——这里不断言`2`优于`1`。
+- **累积loss按样本加权**：`Σ(microbatch_mean × actual_batch_size) / window_samples`，窗口内每个样本等权。`batch_size=1`时`window_samples`等于microbatch数，数学与旧实现完全相同——本页此前的实测（含1.70×那组）都在`batch_size=1`下测得，结论继续有效。旧实现`batch_size>1`时用mean-of-batch-means，窗口内含不等大小批（桶尾）会高估小批里的样本，现已修正；旧`batch_size>1`的state会按新口径续跑，在桶尾窗口上不与旧轨迹逐bit一致，没有legacy开关或兼容层。
+- **样本数只是上界**：只把同桶（同宽高）图片stack成一批，桶尾批更小，所以`batch_size × gradient_accumulation`只是每update样本数的上界；每step记录里的`sample_count`（窗口实际样本数）与`batch_sizes`（各microbatch大小）才是实际值。
+- **容量口径（Windows 16GB）**：判断“装得下”不能只看一个数。`torch.cuda.memory_allocated`/`memory_reserved`只是PyTorch分配器视角，`nvidia-smi`是设备视角，WDDM下还要看进程级`\GPU Process Memory(*)\Dedicated Usage`/`Shared Usage`，并同时满足dedicated仍有剩余余量、allocator retries/OOM为0。**shared增长本身不是溢出**：`loader.pin_memory=true`（预设默认、生产口径）时CUDA pinned主机缓冲就计入shared，属正常，增量应与`torch.cuda.host_memory_stats()`的registered/cached pinned pool对得上；只有**未被pinned pool解释的大额shared增长**才是WDDM spill风险。反过来没有OOM也不等于激活都常驻显存。`pin_memory=false`只作为附录对照。显式CPU offload（checkpoint激活搬CPU）只在本地实验里评估过，不在发布代码里、也没有配置项，**不进本节的容量表**（见「已评估但未采用」）。
+- **显存分配器（可选，显式opt-in）**：`expandable_segments`只在启动前显式设环境变量才生效：`$env:PYTORCH_ALLOC_CONF = 'expandable_segments:True'`（PowerShell，之后照常跑`launch.py train`）。它只改CUDA caching allocator的段管理，不改训练数学、数据、步数或任何配置项；本机torch 2.14.0+cu130/Windows实测支持，旧torch或其他平台不保证。默认不启用：`launch.py`/配置/`requirements.txt`都不设它，也不覆盖你已有的allocator设置（本机torch先读旧名`PYTORCH_CUDA_ALLOC_CONF`，未设置时才读`PYTORCH_ALLOC_CONF`）。
+- **原生前向仍逐样本**：vendor的DiT `forward`按batch维逐样本循环，`batch_size>1`不会自动把单样本内部的计算并行化，只是把多个样本串进同一个update。本地另有一个把这些样本合并成masked batched forward的向量化原型，已弃用、不入库、**不是生产路径**（弃用依据见「已评估但未采用」）。
+- **改配置的名义对齐**：想在不改每update名义样本数的情况下试更大batch，写`batch_size=2, gradient_accumulation=4`（名义8，与预设的`1×8`对齐）；做等样本数对照可用`1×24`/`2×12`/`3×8`（名义都是24）。这些只是**名义样本数对齐**，不是质量等价：本次复测的`1×24`/`2×12`/`3×8`三行在16GB、生产口径下都跑完了一个epoch（见上表），但该结论只限这套数据。两个选项的完整默认值、校验与回退规则见 [TUTORIAL.md](TUTORIAL.md) 第 5 节 `training`。
+
+### 显存贡献：group 与 allocator（早期消融，3 updates）
+
+口径：`bs3 × acc8`、同前3个update、同一native allocator（未开`expandable_segments`）；只报torch `allocated`/`reserved`。该早期消融**没有采PDH shared**，也不能用旧时间宣称可靠加速。
+
+- `group1` → `group2`：warm峰值`allocated` 13.533 → 12.436 GiB，省1.097 GiB（1123 MiB）。
+- `group2`再加`expandable_segments`：warm峰值`reserved` 14.258 → 13.025 GiB，省1.233 GiB（1263 MiB），是分配器缓存/碎片层面的；同期`allocated` 12.436 → 12.426 GiB近似不变。
+- **两个数不能相加**成“总显存节省”：一个降的是保留激活，一个降的是分配器缓存/碎片。组大小只测了`1→2`、只在这一套配置与数据上，不推断更大组或别的rank/分辨率。
+
+### 分组的等价性实跑（BF16 + 生产kernel作用域）
+
+`group2`在BF16实跑（`attention_backend=cudnn`、`compile_pointwise=true`，与逐block checkpoint基准同作用域）逐项比较：726项（54项前向/loss + 672项梯度）的`maxabs`/`meanabs`/`relative_l2`/`mismatch_pct`全为0，覆盖LoRA rank4、LoKr rank4+`factor=16`+`use_scalar`、LoRA rank4+dropout0.1，`batch_size`2/3、`skip_layers`[]/[1]；backward后调用方RNG逐位不变（`caller_rng_restored=true`），冻结基座无梯度且未被改写。另有unit用例23项CPU/CUDA通过（`tests/test_checkpoint_groups.py`8项 + `tests/test_accumulation.py`9项 + `tests/test_training_kernels.py`6项）。这是helper层面的小模型实跑（`dim=128`/4层），不是5B全模型长跑，也不构成质量结论。原始：工作区根目录`temp/train-batch-opt/production-group2-math.json`（即`../temp/...`）。
+
+### 当前生产配置的 kernel 成本构成
+
+口径：真实当前生产配置（`checkpoint_group_size=2`、`attention_backend=cudnn`、`compile_pointwise=true`、`expandable_segments`，`batch_size=1`/`gradient_accumulation=8`）的一次CUDA trace，step2的microbatch2；只聚合kernel原始事件（`cat=kernel`，不重复叠加operator key_averages），是**构成分解，不是受控加速A/B**。
+
+| 类别 | 时间 | 占比 | kernel调用 |
+|---|---|---|---|
+| GEMM | 1300.734ms | 59.1% | 3204 |
+| attention | 530.880ms | 24.1% | 212 |
+| eager elementwise | 259.446ms | 11.8% | 3949 |
+| compiled pointwise | 91.925ms | 4.2% | 897 |
+| copy/cast/cat | 18.271ms | 0.8% | 2080 |
+| 其他 | 0.012ms | ~0% | 6 |
+| kernel总计 | 2201.268ms | — | — |
+
+- GPU活动union/span = 2203678/2283879µs = 96.49%，该trace未观察到kernel重叠；传输只有H2D 3次4.512MB、DtoH 2次5B、DtoD 1次25.240MB（memset 852次2.275GB）。
+- 结论范围：只说明主要device成本在GEMM与attention、host不是主瓶颈；**不说**backend已最优，也不说没有kernel优化空间（没有roofline/SM计数器）。
+- 该profiler的step墙钟被CUPTI额外约6.16s污染，**吞吐一律用上面的resident主表**。原始：工作区根目录`temp/train-batch-opt/production-kernel-summary.json`、`temp/train-batch-opt/production-kernel-profile.jsonl`、`temp/production-kernel-profile.trace-step2.microbatch2.json`（即`../temp/...`，本地测量产物，不随仓库提交）。
+
 ## 独立采样 `samples.py`
 
 `launch.py sample` 之外的独立入口：一次加载模型，可对**任意 prompt**（不需要预先写进 cache）和**多个 checkpoint** 出图：

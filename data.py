@@ -416,17 +416,21 @@ class BucketBatchSampler(Sampler):
             self._buckets.setdefault(key, []).append(index)
         self._bucket_order = sorted(self._buckets)
         self.total_batches = sum((len(indices) + batch_size - 1) // batch_size for indices in self._buckets.values())
+        self._batch_plan: list[list[int]] | None = None
 
     def set_epoch(self, epoch: int, start_batch: int = 0) -> None:
+        if epoch != self.epoch:
+            self._batch_plan = None
         self.epoch = epoch
         self.start_batch = start_batch
 
     def __len__(self) -> int:
         return self.total_batches - self.start_batch
 
-    def __iter__(self):
-        epoch, start_batch = self.epoch, self.start_batch
-        rng = random.Random(_stable_seed(self.seed, epoch, "batches"))
+    def _epoch_batches(self) -> list[list[int]]:
+        if self._batch_plan is not None:
+            return self._batch_plan
+        rng = random.Random(_stable_seed(self.seed, self.epoch, "batches"))
         batches = []
         for key in self._bucket_order:
             indices = self._buckets[key].copy()
@@ -434,6 +438,20 @@ class BucketBatchSampler(Sampler):
             for start in range(0, len(indices), self.batch_size):
                 batches.append(indices[start : start + self.batch_size])
         rng.shuffle(batches)
+        self._batch_plan = batches
+        return batches
+
+    def sample_count(self, start_batch: int, batch_count: int) -> int:
+        """Count samples in an absolute epoch batch range without loading data."""
+        batches = self._epoch_batches()
+        count = 0
+        for position in range(start_batch, start_batch + batch_count):
+            count += len(batches[position])
+        return count
+
+    def __iter__(self):
+        epoch, start_batch = self.epoch, self.start_batch
+        batches = self._epoch_batches()
         for position in range(start_batch, len(batches)):
             yield [(index, epoch) for index in batches[position]]
 

@@ -13,7 +13,7 @@ are zero-based; an epoch-end cursor is the next epoch with next_batch=0.
 
 Flow: x_sigma = (1 - sigma) * x0 + sigma * noise; timestep = 1000 * sigma;
 target = noise - x0. An epoch's last accumulation window is never joined to
-the next epoch and is normalized by its actual number of microbatches.
+the next epoch and is normalized by its actual number of samples.
 """
 
 from __future__ import annotations
@@ -59,6 +59,11 @@ def sample_sigma(count, sampling, logit_mean, logit_std, generator, device) -> t
         normal = torch.randn(count, generator=generator, device=device, dtype=torch.float32)
         return torch.sigmoid(normal * logit_std + logit_mean)
     raise ValueError(f"unsupported timestep_sampling: {sampling!r}")
+
+
+def _sample_weighted_loss(loss: torch.Tensor, batch_size: int, window_samples: int) -> torch.Tensor:
+    """Give each sample equal weight across an accumulation window's bucket batches."""
+    return loss * batch_size / window_samples
 
 
 def log_entry(handle, entry: dict) -> None:
@@ -166,6 +171,7 @@ def main() -> None:
         cache_dir = args.cache_dir.resolve()
     attention_backend = runtime.resolve_attention_backend(config, resumed=resume is not None)
     compile_pointwise = runtime.resolve_compile_pointwise(config)
+    checkpoint_group_size = runtime.resolve_checkpoint_group_size(config)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
 
@@ -259,7 +265,8 @@ def main() -> None:
     run_peak_vram_gib = 0.0
     batches = None
     tqdm.write(
-        f"Training started: step={global_step}/{total_steps} output={output_dir}",
+        f"Training started: step={global_step}/{total_steps} output={output_dir} "
+        f"checkpoint_group_size={checkpoint_group_size}",
         file=sys.stdout,
     )
     with (
@@ -294,6 +301,7 @@ def main() -> None:
                 "loader": config["loader"],
                 "attention_backend": attention_backend,
                 "compile_pointwise": compile_pointwise,
+                "checkpoint_group_size": checkpoint_group_size,
                 "optimizers": {
                     name: {
                         "class": f"{type(optimizer).__module__}.{type(optimizer).__name__}",
@@ -324,6 +332,7 @@ def main() -> None:
             step_epoch = epoch
             batch_in_epoch = next_batch
             microbatch_count = min(accumulation, sampler.total_batches - next_batch)
+            window_samples = sampler.sample_count(next_batch, microbatch_count)
             used_lrs = {
                 name: [float(group["lr"]) for group in optimizer.param_groups]
                 for name, optimizer in optimizers.items()
@@ -347,8 +356,11 @@ def main() -> None:
                 mask = batch["attention_mask"].to(device="cuda", non_blocking=True)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     prediction = dit(noisy, timestep, context, mask).sample
-                loss = F.mse_loss(prediction.float(), noise - latents)
-                (loss / microbatch_count).backward()
+                actual_batch_size = len(batch["indices"])
+                loss = _sample_weighted_loss(
+                    F.mse_loss(prediction.float(), noise - latents), actual_batch_size, window_samples
+                )
+                loss.backward()
                 if total_loss is None:
                     total_loss = loss.detach()
                 else:
@@ -367,7 +379,7 @@ def main() -> None:
                         caption_stats[key] = min(caption_stats[key], batch_stats[key])
                     for key in ("chars_max", "tokens_max"):
                         caption_stats[key] = max(caption_stats[key], batch_stats[key])
-                batch_sizes.append(len(batch["indices"]))
+                batch_sizes.append(actual_batch_size)
                 next_batch += 1
                 # Release graph outputs and device inputs before a live-preview VAE is loaded.
                 del prediction, loss, noisy, timestep, sigma, noise, latents, raw, context, mask, batch
@@ -386,7 +398,7 @@ def main() -> None:
                 next_batch = 0
                 batches = None
 
-            loss_value = total_loss.item() / microbatch_count
+            loss_value = total_loss.item()
             grad_norm_value = float(grad_norm)
             del total_loss, grad_norm
             peak_vram_gib = torch.cuda.max_memory_allocated() / 2**30
@@ -402,6 +414,7 @@ def main() -> None:
                     "next_batch": next_batch,
                     "completed_epochs": epoch,
                     "microbatch_count": microbatch_count,
+                    "sample_count": window_samples,
                     "loss": loss_value,
                     "lr": used_lrs,
                     "grad_norm": grad_norm_value,
@@ -414,6 +427,8 @@ def main() -> None:
                     "batch_sizes": batch_sizes,
                     "allocated_vram_gib": round(torch.cuda.memory_allocated() / 2**30, 3),
                     "peak_vram_gib": round(peak_vram_gib, 3),
+                    "reserved_vram_gib": round(torch.cuda.memory_reserved() / 2**30, 3),
+                    "peak_reserved_vram_gib": round(torch.cuda.max_memory_reserved() / 2**30, 3),
                 },
             )
             progress.set_postfix(

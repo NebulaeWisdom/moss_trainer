@@ -46,7 +46,7 @@ python launch.py train --config configs/moss_official.json --cache-dir temp/my-c
 
 ## 独立采样 samples.py
 
-`launch.py sample` 之外的独立入口：一次加载模型，可对任意 prompt（不需要预先写进 cache）和多个 checkpoint 出图。`--adapter` 可传多个文件，`--multiplier 0` 只出基座图；`--output-dir` 同样必须是新目录。
+`launch.py sample` 之外的独立入口：一次加载模型，可对任意 prompt（不需要预先写进 cache）和多个 checkpoint 出图。`sample.prompt` 支持字符串或字符串列表；训练预览、`launch.py sample` 和 `samples.py` 都会为列表中的每条 prompt 分别出图。`--adapter` 可传多个文件；只采样基座时传 `--multiplier 0`，无需 adapter。非零 multiplier 必须提供 adapter。`--output-dir` 同样必须是新目录。
 
 ```powershell
 python samples.py --config runs/my-run/config.json `
@@ -54,6 +54,52 @@ python samples.py --config runs/my-run/config.json `
   --prompts "..." --seed 42 --width 832 --height 1216 --steps 20 --cfg 3 `
   --output-dir temp/new-dir
 ```
+
+只评估基座、多 prompt：
+
+```powershell
+python samples.py --config configs/moss_official.json --multiplier 0 `
+  --prompts "an alpine lake at dawn" "a small observatory under the stars" `
+  --output-dir temp/base-evaluation
+```
+
+每张图的文件名包含 `prompt000` / `prompt001` 和 seed；`parameters.json` 保存完整 prompt、采样参数、来源与耗时。
+
+## WebUI 工作台
+
+WebUI 是独立的本地进程，不会被 `launch.py` 或训练代码导入。训练仍可完全通过原有 CLI 使用；WebUI 启动失败不影响 CLI。关闭浏览器或 WebUI 服务**不会停止已启动的任务**；只有任务上的「停止」按钮会结束它管理的进程树。
+
+在 `moss_image_trainer/` 工作根使用项目 venv：
+
+```powershell
+.\venv\Scripts\python.exe -m pip install -r .\moss_trainer\requirements-webui.txt
+.\venv\Scripts\python.exe -m moss_trainer.webui --host 127.0.0.1 --port 7860
+```
+
+浏览器访问 <http://127.0.0.1:7860>。前端资源随仓库提供，运行时不依赖 CDN，也不需要 Node.js。默认仅供本机使用，不提供账号认证，不应直接发布到公网。
+
+- **配置**：加载预设，通过分组表单编辑。保存时新建命名版本，不覆盖原文件；未保存的当前表单也可作为任务快照启动。
+- **任务控制**：先生成缓存，再用缓存目录训练；输出自动进入唯一子目录。基座采样无需 adapter，adapter / 对比模式使用匹配配置的 checkpoint。
+- **观察**：显示 CPU、RAM、磁盘和 NVIDIA GPU/显存/温度/功耗；不支持的硬件指标显示不可用，不伪造读数。任务日志、训练 loss / 学习率 / 耗时曲线与数值表、采样图库来自真实任务文件。
+- **进程与数据**：状态和日志保存在 `moss_trainer/.webui/`；服务重启后可继续观察原任务。一次只运行一个工作台 GPU 任务，避免缓存、训练和采样争抢显存。
+- **停止**：当前训练器没有优雅停止协议，停止会终止任务进程树；保留已写入的 checkpoint、日志和图片，未保存的训练进度不会自动补存。
+- **采样与恢复**：多 prompt 一项一条；加载 adapter 必须匹配 algo / rank / alpha 等设置。训练恢复只应选择可信的本地 `state.pt`，恢复参数以该状态文件中的配置为准。
+
+WebUI 不会自动修改性能设置。如果当前环境不支持 Triton / Inductor，请在训练表单中关闭 `compile_pointwise`；具体限制见下方「性能开关」。
+
+### 运行范围与前端源码
+
+工作台只管理自己启动的任务，不会接管或停止另一个终端手工启动的 Python 进程。恢复已有 CLI 训练时，状态文件必须位于工作目录内，旁边保留该次训练的 `config.json`。指标展示最近 5,000 个 step（最多读取日志末尾 4 MiB），图库最多展示最近 500 张识别到的采样 PNG；原始文件不被裁剪或删除。
+
+前端源码位于 `webui/frontend/`（Vue 3、Element Plus、ECharts），后端位于 `webui/`（FastAPI、psutil、NVML）。仅修改前端源码时需要 Node.js：
+
+```powershell
+# 在 moss_trainer/webui/frontend/ 中执行
+npm install --cache ../../../temp/npm-cache
+npm run build
+```
+
+每次构建生成新的 `webui/static/<build-id>/`，不会清空旧版本。重启 WebUI 后会选择最新完整版本；已运行训练不受影响。任务日志、配置版本、旧构建和验收产物都不会自动清理。
 
 ## 配置预设
 

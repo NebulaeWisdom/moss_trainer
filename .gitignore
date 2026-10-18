@@ -6,3 +6,6 @@ cache/
 temp/
 RUN_RESULT.md
 FEATURE_RESULT.md
+.webui/
+webui/frontend/node_modules/
+webui/frontend/.vite/

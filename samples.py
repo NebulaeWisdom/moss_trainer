@@ -1,4 +1,4 @@
-"""Sample a prompt/seed/multiplier matrix with one shared MOSS-Image model load."""
+"""Sample a shared-model prompt/seed/multiplier matrix; omit --adapter for --multiplier 0."""
 
 from __future__ import annotations
 
@@ -21,7 +21,10 @@ from .launch import configure_environment
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--adapter", type=Path, nargs="+", required=True)
+    parser.add_argument(
+        "--adapter", type=Path, nargs="+",
+        help="Adapter checkpoint paths; optional only when all multipliers are zero.",
+    )
     parser.add_argument("--multiplier", type=float, nargs="+", default=[1.0])
     prompt_source = parser.add_mutually_exclusive_group()
     prompt_source.add_argument("--prompts", nargs="+")
@@ -63,7 +66,9 @@ def main() -> None:
     multipliers = list(dict.fromkeys(args.multiplier))
     nonzero_multipliers = [multiplier for multiplier in multipliers if multiplier != 0.0]
     include_base = 0.0 in multipliers
-    adapter_paths = [path.resolve() for path in args.adapter]
+    if args.adapter is None and nonzero_multipliers:
+        parser.error("--adapter is required unless all --multiplier values are zero.")
+    adapter_paths = [path.resolve() for path in (args.adapter or [])]
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
 
@@ -99,11 +104,14 @@ def main() -> None:
     phase_timings["dit_load_seconds"] = time.perf_counter() - phase_started
     load_counts["dit"] += 1
 
-    phase_started = time.perf_counter()
-    network = create_adapter(dit, config)
-    network.to(dtype=torch.bfloat16).eval().requires_grad_(False)
-    phase_timings["adapter_create_seconds"] = time.perf_counter() - phase_started
-    load_counts["adapter_network"] += 1
+    network = None
+    phase_timings["adapter_create_seconds"] = 0.0
+    if adapter_paths:
+        phase_started = time.perf_counter()
+        network = create_adapter(dit, config)
+        network.to(dtype=torch.bfloat16).eval().requires_grad_(False)
+        phase_timings["adapter_create_seconds"] = time.perf_counter() - phase_started
+        load_counts["adapter_network"] += 1
 
     phase_started = time.perf_counter()
     print("Loading VAE", flush=True)
@@ -131,33 +139,34 @@ def main() -> None:
     ) as progress:
         negative = conditioning[negative_prompt].unsqueeze(0).to(device="cuda", dtype=torch.bfloat16)
         negative_mask = torch.ones(negative.shape[:2], device="cuda", dtype=torch.bool)
-        for adapter_index, adapter_path in enumerate(adapter_paths):
-            phase_started = time.perf_counter()
-            weights = load_file(str(adapter_path), device="cpu")
-            network.load_state_dict(weights, strict=True)
-            tensor_count = len(weights)
-            del weights
-            adapter_load_seconds = time.perf_counter() - phase_started
-            phase_timings["adapter_load_seconds"] += adapter_load_seconds
-            load_counts["adapter_checkpoints"] += 1
+        for adapter_index, adapter_path in enumerate(adapter_paths or [None]):
+            if adapter_path is not None:
+                phase_started = time.perf_counter()
+                weights = load_file(str(adapter_path), device="cpu")
+                network.load_state_dict(weights, strict=True)
+                tensor_count = len(weights)
+                del weights
+                adapter_load_seconds = time.perf_counter() - phase_started
+                phase_timings["adapter_load_seconds"] += adapter_load_seconds
+                load_counts["adapter_checkpoints"] += 1
 
-            phase_started = time.perf_counter()
-            with adapter_path.open("rb") as handle:
-                adapter_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
-            adapter_hash_seconds = time.perf_counter() - phase_started
-            phase_timings["adapter_hash_seconds"] += adapter_hash_seconds
-            adapters.append({
-                "index": adapter_index,
-                "path": str(adapter_path),
-                "sha256": adapter_sha256,
-                "tensor_count": tensor_count,
-                "load_seconds": adapter_load_seconds,
-                "hash_seconds": adapter_hash_seconds,
-            })
-            progress.write(
-                f"Loaded adapter{adapter_index:02d} {adapter_path.name}: {tensor_count} tensors",
-                file=sys.stdout,
-            )
+                phase_started = time.perf_counter()
+                with adapter_path.open("rb") as handle:
+                    adapter_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+                adapter_hash_seconds = time.perf_counter() - phase_started
+                phase_timings["adapter_hash_seconds"] += adapter_hash_seconds
+                adapters.append({
+                    "index": adapter_index,
+                    "path": str(adapter_path),
+                    "sha256": adapter_sha256,
+                    "tensor_count": tensor_count,
+                    "load_seconds": adapter_load_seconds,
+                    "hash_seconds": adapter_hash_seconds,
+                })
+                progress.write(
+                    f"Loaded adapter{adapter_index:02d} {adapter_path.name}: {tensor_count} tensors",
+                    file=sys.stdout,
+                )
             active_multipliers = (
                 [0.0] if include_base and adapter_index == 0 else []
             ) + nonzero_multipliers
@@ -169,7 +178,8 @@ def main() -> None:
                 for seed in seeds:
                     for multiplier in active_multipliers:
                         image_started = time.perf_counter()
-                        network.set_multiplier(multiplier)
+                        if network is not None:
+                            network.set_multiplier(multiplier)
                         latent = sample_latents(
                             pipe, sample, positive, positive_mask, negative, negative_mask,
                             generator.manual_seed(seed),
@@ -222,7 +232,7 @@ def main() -> None:
             for key in ("width", "height", "num_inference_steps", "guidance_scale")
         },
         "adapters": adapters,
-        "adapter_modules": len(network.loras),
+        "adapter_modules": len(network.loras) if network is not None else 0,
         "images": images,
         "phase_timings": phase_timings,
         "load_counts": load_counts,

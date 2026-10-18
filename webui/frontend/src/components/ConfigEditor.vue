@@ -1,9 +1,20 @@
+<script>
+// Draft tokens are replaced only by explicit loads, never by immutable edits.
+// Weak keys retain conversion tails across page remounts without serializing them.
+const draftConversions = new WeakMap()
+</script>
+
 <script setup>
 import { computed, ref, watch } from 'vue'
 import ConfigField from './ConfigField.vue'
-const props = defineProps({ modelValue: { type: Object, required: true }, schema: { type: Object, default: () => ({}) } })
+const props = defineProps({ modelValue: { type: Object, required: true }, schema: { type: Object, default: () => ({}) }, draftToken: { type: Object, required: true } })
 const emit = defineEmits(['update:modelValue'])
 const selectedSection = ref('')
+const sectionHint = computed(() => Object.hasOwn(props.schema.fields || {}, selectedSection.value) ? props.schema.fields[selectedSection.value] : null)
+const conversionCache = computed(() => {
+  if (!draftConversions.has(props.draftToken)) draftConversions.set(props.draftToken, new Map())
+  return draftConversions.get(props.draftToken)
+})
 const sections = computed(() => {
   const declared = props.schema.sections || []
   const known = declared.filter(section => Object.hasOwn(props.modelValue, section.key))
@@ -21,8 +32,10 @@ watch(() => sections.value.map(section => section.key).join('\n'), (_, previous)
 const missing = computed(() => (props.schema.sections || []).filter(section => !Object.hasOwn(props.modelValue, section.key)))
 function update(key, value) { emit('update:modelValue', { ...props.modelValue, [key]: value }) }
 function addSection() {
-  if (!selectedSection.value || Object.hasOwn(props.modelValue, selectedSection.value)) return
-  update(selectedSection.value, selectedSection.value === 'model_dir' ? '' : {})
+  if (!sectionHint.value || Object.hasOwn(props.modelValue, selectedSection.value)) return
+  const value = JSON.parse(JSON.stringify(sectionHint.value.default))
+  for (const key of conversionCache.value.keys()) if (key === selectedSection.value || key.startsWith(`${selectedSection.value}.`)) conversionCache.value.delete(key)
+  update(selectedSection.value, value)
   selectedSection.value = ''
 }
 </script>
@@ -37,12 +50,12 @@ function addSection() {
       <el-collapse-item v-for="section in sections" :key="section.key" :name="section.key">
         <template #title><div class="section-title"><span class="section-dot" /><span>{{ section.label }}</span><code>{{ section.key }}</code></div></template>
         <p class="section-description">{{ section.description }}</p>
-        <ConfigField :model-value="modelValue[section.key]" :path="section.key" :schema="schema.fields || {}" @update:model-value="update(section.key, $event)" />
+        <ConfigField :model-value="modelValue[section.key]" :path="section.key" :schema="schema.fields || {}" :conversion-cache="conversionCache" @update:model-value="update(section.key, $event)" />
       </el-collapse-item>
     </el-collapse>
-    <div class="add-section">
-      <el-select v-model="selectedSection" filterable allow-create default-first-option placeholder="添加配置分组 / 自定义字段" aria-label="新增配置分组"><el-option v-for="section in missing" :key="section.key" :label="section.label" :value="section.key" /></el-select>
-      <el-button @click="addSection" :disabled="!selectedSection">添加分组</el-button>
+    <div v-if="missing.length" class="add-section">
+      <el-select v-model="selectedSection" filterable default-first-option placeholder="添加已知配置分组" aria-label="新增配置分组"><el-option v-for="section in missing" :key="section.key" :label="section.label" :value="section.key" /></el-select>
+      <el-button @click="addSection" :disabled="!sectionHint">添加分组</el-button>
     </div>
   </div>
 </template>

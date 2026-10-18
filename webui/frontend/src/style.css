@@ -171,7 +171,7 @@ a { color: var(--iolite-text); text-decoration: none; }
 .workspace-nav button > .el-icon { font-size: 19px; }
 .workspace-nav button:hover { background: var(--surface-2); }
 .workspace-nav button.selected { background: color-mix(in srgb, var(--iolite) 12%, var(--surface)); border-color: color-mix(in srgb, var(--iolite) 25%, transparent); color: var(--iolite-text); }
-.workspace-nav button > span:not(.el-icon):not(.nav-gem) { display: flex; align-items: baseline; gap: 8px; font-size: 13px; font-weight: 600; }
+.workspace-nav button > span:not(.el-icon):not(.nav-gem) { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; font-size: 13px; font-weight: 600; }
 .workspace-nav small { font-size: 11px; font-weight: 400; opacity: .8; }
 .nav-gem { margin-left: auto; width: 5px; height: 5px; border-radius: 50%; }
 .sidebar-processes { margin-top: 28px; padding-top: 22px; border-top: 1px solid var(--border); }
@@ -303,6 +303,7 @@ a { color: var(--iolite-text); text-decoration: none; }
 .type-select { width: 112px !important; flex-shrink: 0; }
 .type-select .el-select__wrapper { min-height: 28px; background: var(--surface-2); box-shadow: none; font-size: 11px; }
 .field-hint { font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; line-height: 1.6; overflow-wrap: anywhere; }
+.field-type { flex-shrink: 0; font-size: 11px; color: var(--text-secondary); background: var(--surface-2); border-radius: 6px; padding: 3px 8px; }
 .field-path { display: block; color: var(--text-muted); font-size: 10px; line-height: 1.5; margin-top: 6px; overflow-wrap: anywhere; }
 .config-field > .el-input-number { width: 100%; max-width: 300px; }
 .config-field > .el-select:not(.type-select) { width: 100%; }
@@ -337,12 +338,12 @@ a { color: var(--iolite-text); text-decoration: none; }
 .audit-view { white-space: pre-wrap; overflow-wrap: anywhere; padding: 20px; background: var(--sunken); border: 1px solid var(--border); border-radius: 10px; color: var(--text-secondary); font-size: 12px; line-height: 1.7; }
 .dialog-source { font-size: 12px; color: var(--text-secondary); margin: 20px 0 12px; overflow-wrap: anywhere; }
 
-/* Launch, monitoring and standalone sampling */
+/* Training pipeline and independent evaluation */
 .launch-context .el-card__body { padding: 18px 20px; }
 .launch-context-title { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; margin-bottom: 12px; }
 .launch-context-title .muted { font-size: 11px; }
 .launch-context .el-form-item { margin-bottom: 0; }
-.control-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: stretch; }
+.control-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: stretch; }
 .control-card { border-left: 3px solid var(--iolite); display: flex; flex-direction: column; }
 .control-card.cache { border-left-color: var(--sapphire); }
 .control-card.train { border-left-color: var(--amber); }
@@ -353,8 +354,6 @@ a { color: var(--iolite-text); text-decoration: none; }
 .control-hint { font-size: 11px; color: var(--text-secondary); line-height: 1.8; }
 .control-card .warning-text { font-size: 11px; }
 .control-card .el-form-item__label { font-size: 12px; }
-.sample-mode-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 12px 0; }
-.sample-mode-summary .el-button { padding: 6px; font-size: 12px; }
 .process-facts { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 16px; border-top: 1px solid var(--border); padding-top: 8px; font-size: 10px; color: var(--text-secondary); }
 .process-facts code { font-size: 10px; }
 .launch-reason { margin-top: 12px; color: var(--text-secondary); font-size: 10px; }
@@ -582,4 +581,69 @@ a { color: var(--iolite-text); text-decoration: none; }
 @media (forced-colors: active) {
   .live-dot, .section-dot, .nav-gem, .process-dot { background: CanvasText; }
   .workspace-nav button.selected, .mobile-nav button.selected { border: 2px solid Highlight; }
+}
+
+/* Provenance-scoped matrices keep overflow inside the workspace. */
+.workspace > .el-card, .run-detail, .detail-tabs, .image-matrix { min-width: 0; max-width: 100%; }
+.stage-summary-note { color: var(--text-secondary); font-size: 13px; margin-top: 24px; line-height: 1.9; }
+.evaluation-form { margin-top: 24px; }
+.evaluation-form .warning-text { margin: 16px 0 24px; }
+.checkpoint-select-row, .checkpoint-explicit { display: flex; gap: 10px; width: 100%; }
+.checkpoint-select-row > .el-select, .checkpoint-explicit > .el-input { flex: 1; min-width: 0; }
+.checkpoint-sources { list-style: none; margin: 16px 0; padding: 0; }
+.checkpoint-sources li { padding: 8px 0; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+.checkpoint-sources code { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 11px; }
+.checkpoint-sources .el-button { flex-shrink: 0; font-size: 11px; }
+.evaluate-training-action { border: 1px solid color-mix(in srgb, var(--taaffeite) 35%, var(--border)); border-radius: 10px; background: color-mix(in srgb, var(--taaffeite) 7%, var(--surface)); padding: 12px 16px; }
+.evaluate-training-action p { margin: 8px 0 0; }
+.matrix-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin: 6px 0 18px; }
+.matrix-heading p { font-size: 11px; margin-top: 6px; max-width: 720px; }
+.image-matrix > .el-alert { margin-bottom: 16px; }
+.matrix-scroll { width: 100%; max-width: 100%; overflow: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--sunken); }
+.matrix-scroll:focus-visible { outline: 2px solid var(--iolite); outline-offset: 2px; }
+.matrix-table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; table-layout: fixed; }
+.matrix-table th, .matrix-table td { border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); width: 210px; min-width: 210px; max-width: 210px; padding: 12px; text-align: left; vertical-align: top; }
+.matrix-table thead th { background: var(--surface-2); position: sticky; top: 0; z-index: 2; }
+.matrix-table th > strong { font-size: 12px; display: block; overflow-wrap: anywhere; }
+.matrix-table th > small { font-size: 10px; color: var(--text-secondary); display: block; margin-top: 6px; overflow-wrap: anywhere; }
+.matrix-table thead th > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.matrix-table th:first-child { position: sticky; left: 0; width: 230px; min-width: 230px; max-width: 230px; background: var(--surface); z-index: 3; }
+.matrix-table thead th:first-child { z-index: 4; font-size: 10px; letter-spacing: .06em; color: var(--text-secondary); background: var(--surface-2); }
+.matrix-table tbody th p { font-size: 11px; font-weight: 400; line-height: 1.7; margin-top: 12px; overflow-wrap: anywhere; }
+.matrix-table tbody th .eyebrow { font-size: 9px; color: var(--taaffeite-text); }
+.matrix-table details { margin-top: 12px; font-size: 10px; color: var(--text-secondary); font-weight: 400; }
+.matrix-table details summary { cursor: pointer; }
+.matrix-table details pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; font-size: 9px; }
+.matrix-image-button { display: block; width: 100%; padding: 0; border: 1px solid transparent; background: transparent; color: var(--text-secondary); border-radius: 6px; overflow: hidden; text-align: left; }
+.matrix-image-button:hover { border-color: var(--taaffeite); }
+.matrix-image-button + .matrix-image-button { margin-top: 8px; }
+.matrix-image-button img { display: block; width: 100%; height: 240px; object-fit: contain; background: var(--sunken); }
+.matrix-image-button span { display: block; padding: 6px; font: 9px/1.5 Consolas, monospace; overflow-wrap: anywhere; }
+.matrix-missing { min-height: 240px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 12px; border: 1px dashed var(--border-strong); border-radius: 8px; }
+.matrix-missing small { display: block; font-size: 10px; color: var(--text-muted); margin-top: 8px; }
+.probe-comparison { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
+.probe-comparison > .field-hint { margin-top: 6px; }
+.comparison-controls { display: grid; grid-template-columns: minmax(0, 1.5fr) repeat(2, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
+.comparison-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.comparison-pair article { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 10px; }
+.comparison-pair article > h3 { margin-bottom: 10px; font: 12px Consolas, monospace; color: var(--taaffeite-text); }
+.comparison-pair img { height: min(52vh, 480px); }
+.unclassified-images { margin-top: 24px; }
+.unclassified-images .gallery { margin-top: 16px; }
+@media (max-width: 767px) {
+  .sampler-card > .el-card__header { flex-direction: column; align-items: flex-start; }
+  .sampler-card > .el-card__header > .el-button { margin: 0; min-height: 44px; font-size: 12px; max-width: 100%; }
+  .checkpoint-select-row, .checkpoint-explicit { flex-wrap: wrap; }
+  .checkpoint-select-row > .el-select, .checkpoint-explicit > .el-input { flex-basis: 100%; }
+  .checkpoint-sources li { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .matrix-heading { flex-direction: column; gap: 10px; }
+  .matrix-table th:first-child { min-width: 150px; max-width: 150px; width: 150px; }
+  .matrix-table th, .matrix-table td { min-width: 180px; max-width: 180px; width: 180px; padding: 8px; }
+  .matrix-table tbody th p { font-size: 10px; }
+  .matrix-image-button img, .matrix-missing { height: 210px; min-height: 210px; }
+  .comparison-controls { grid-template-columns: minmax(0, 1fr); }
+  .comparison-pair { gap: 10px; }
+  .comparison-pair article { padding: 8px; }
+  .comparison-pair img { height: 240px; min-height: 0; }
+  .evaluate-training-action > .el-button { height: auto; white-space: normal; min-height: 44px; }
 }

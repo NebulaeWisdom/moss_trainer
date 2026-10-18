@@ -25,9 +25,9 @@ export async function request(path, options = {}) {
 
 export const clone = value => JSON.parse(JSON.stringify(value))
 export const active = job => ['queued', 'running', 'stopping'].includes(job?.status)
-export const stageName = stage => ({ cache: 'Cache 缓存', train: 'Train 训练', sample: 'Sample 采样' }[stage] || stage)
+export const stageName = stage => ({ cache: 'Cache 缓存', train: 'Train 训练', evaluation: 'XY Evaluation 评估' }[stage] || stage)
 export const statusName = job => ({
-  queued: 'Queued 等待启动', running: { cache: 'Caching 缓存中', train: 'Training 训练中', sample: 'Sampling 采样中' }[job?.stage] || 'Running 运行中',
+  queued: 'Queued 等待启动', running: { cache: 'Caching 缓存中', train: 'Training 训练中', evaluation: 'Evaluating 评估中' }[job?.stage] || 'Running 运行中',
   stopping: 'Stopping 停止中', completed: 'Completed 已完成', failed: 'Failed 失败', stopped: 'Stopped 已停止', interrupted: 'Interrupted 已中断',
 }[job?.status] || 'Idle 空闲')
 export const statusType = job => ({ completed: 'success', failed: 'danger', stopping: 'danger', running: 'warning', queued: 'primary' }[job?.status] || 'info')

@@ -1,23 +1,36 @@
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { active, clone, request } from './api'
 
 export function useWorkbench() {
   const stored = key => { try { return localStorage.getItem(`moss.${key}`) } catch { return null } }
   const persist = (key, value) => { try { localStorage.setItem(`moss.${key}`, value) } catch { /* Storage can be disabled. */ } }
-  const page = ref(['overview', 'configuration', 'samples', 'runs'].includes(stored('page')) ? stored('page') : 'overview')
+  const rememberedPage = stored('page') === 'samples' ? 'evaluations' : stored('page')
+  const page = ref(['overview', 'configuration', 'evaluations', 'runs'].includes(rememberedPage) ? rememberedPage : 'overview')
   const theme = ref(stored('theme') === 'light' ? 'light' : 'dark')
   const info = ref(null)
   const schema = ref({ sections: [], fields: {} })
   const configs = ref([])
   const configRecord = ref(null)
   const config = ref(null)
+  const configDraftToken = shallowRef({})
+  const evaluationConfig = ref(null)
+  const evaluationDraftToken = shallowRef({})
+  const evaluationOrigin = ref('尚未初始化独立评估配置')
+  const evaluationBaseline = ref('')
+  const evaluationLoading = ref(false)
+  const checkpoints = ref([])
+  const checkpointsLoading = ref(false)
+  const jobConfig = ref(null)
+  const pipelineJobId = ref(stored('pipelineJob') || '')
+  const evaluationJobId = ref(stored('evaluationJob') || '')
   const baseline = ref('')
   const jobs = ref([])
   const selectedId = ref(stored('selectedJob') || '')
   const system = ref(null)
   const metrics = ref({ series: [], columns: [], source: null })
   const images = ref([])
+  const imagesTruncated = ref(false)
   const logs = ref('')
   const logTrimmed = ref(false)
   const logOffset = ref(0)
@@ -35,10 +48,12 @@ export function useWorkbench() {
   const snapshot = ref(null)
   const snapshotDialog = ref(false)
   const snapshotLoading = ref(false)
-  const options = reactive({ cacheParent: '', cacheDir: '', outputParent: '', resume: '', adapter: '', sampleMode: 'base', cacheName: '', trainName: '', sampleName: '' })
+  const options = reactive({ cacheParent: '', cacheDir: '', outputParent: '', resume: '', cacheName: '', trainName: '' })
+  const evaluationOptions = reactive({ adapters: [], includeBase: true, outputParent: '', name: '' })
   const selectedJob = computed(() => jobs.value.find(job => job.id === selectedId.value) || null)
   const activeJobs = computed(() => jobs.value.filter(active))
   const dirty = computed(() => config.value !== null && JSON.stringify(config.value) !== baseline.value)
+  const evaluationDirty = computed(() => evaluationConfig.value !== null && JSON.stringify(evaluationConfig.value) !== evaluationBaseline.value)
   const newestMetric = computed(() => metrics.value.series.at(-1) || {})
   const errorList = computed(() => Object.entries(errors).map(([key, message]) => ({ key, message })))
   const configurationName = computed(() => configRecord.value?.name || '未加载配置')
@@ -50,6 +65,12 @@ export function useWorkbench() {
 
   watch(page, async value => {
     persist('page', value)
+    if (value === 'evaluations') {
+      refreshCheckpoints()
+      if (selectedJob.value?.stage !== 'evaluation') selectedId.value = jobs.value.find(job => job.id === evaluationJobId.value && job.stage === 'evaluation')?.id || jobs.value.find(job => job.stage === 'evaluation')?.id || ''
+    } else if (value === 'runs' && selectedJob.value?.stage === 'evaluation') {
+      selectedId.value = jobs.value.find(job => job.id === pipelineJobId.value && job.stage !== 'evaluation')?.id || jobs.value.find(job => job.stage !== 'evaluation')?.id || ''
+    }
     refreshDetails()
     await nextTick()
     window.scrollTo({ top: 0, left: 0, behavior: 'instant' })
@@ -57,13 +78,17 @@ export function useWorkbench() {
   watch(theme, value => { document.documentElement.classList.toggle('dark', value === 'dark'); document.documentElement.dataset.theme = value; persist('theme', value) }, { immediate: true })
   watch(selectedId, value => {
     persist('selectedJob', value)
+    if (selectedJob.value?.stage === 'evaluation') { evaluationJobId.value = value; persist('evaluationJob', value) }
+    else if (selectedJob.value) { pipelineJobId.value = value; persist('pipelineJob', value) }
+    jobConfig.value = null
     detailsVersion += 1
     metrics.value = { series: [], columns: [], source: null }
     images.value = []
+    imagesTruncated.value = false
     logs.value = ''
     logOffset.value = 0
     logTrimmed.value = false
-    for (const key of ['metrics', 'images', 'logs', 'job']) delete errors[key]
+    for (const key of ['metrics', 'images', 'logs', 'job', 'jobConfig']) delete errors[key]
     refreshDetails()
   })
 
@@ -87,6 +112,7 @@ export function useWorkbench() {
         const record = await request(`/config?id=${encodeURIComponent(id)}`)
         configRecord.value = record
         config.value = clone(record.config)
+        configDraftToken.value = {}
         baseline.value = JSON.stringify(record.config)
         persist('selectedConfig', record.id)
       })
@@ -95,14 +121,21 @@ export function useWorkbench() {
   async function refreshConfigs() {
     return attempt('configs', async () => { const data = await request('/configs'); configs.value = data.configs; return data })
   }
+  async function refreshCheckpoints() {
+    if (checkpointsLoading.value) return
+    checkpointsLoading.value = true
+    try { return await attempt('checkpoints', async () => { const result = await request('/checkpoints'); checkpoints.value = result.checkpoints; if (result.truncated) ElMessage.warning('检查点扫描窗口已截断；可显式添加未列出的工作区检查点路径。'); return result }) }
+    finally { checkpointsLoading.value = false }
+  }
   async function initialize() {
     initializing.value = true
     try {
       const [, , listing] = await Promise.all([
-        attempt('info', async () => { info.value = await request('/info'); if (!options.outputParent) options.outputParent = info.value.default_output_root; if (!options.cacheParent) options.cacheParent = `${info.value.workspace_dir.replace(/[/\\]$/, '')}/temp/webui-cache` }),
+        attempt('info', async () => { info.value = await request('/info'); if (!options.outputParent) options.outputParent = info.value.default_output_root; if (!evaluationOptions.outputParent) evaluationOptions.outputParent = info.value.default_output_root; if (!options.cacheParent) options.cacheParent = `${info.value.workspace_dir.replace(/[/\\]$/, '')}/temp/webui-cache` }),
         attempt('schema', async () => { schema.value = await request('/schema') }),
         refreshConfigs(),
         poll(),
+        refreshCheckpoints(),
       ])
       if (!config.value && listing?.configs?.length) {
         const remembered = listing.configs.find(item => item.id === stored('selectedConfig'))
@@ -123,9 +156,11 @@ export function useWorkbench() {
     }
     try {
       const work = []
-      if (page.value === 'overview' || page.value === 'runs') work.push(fetchPart('metrics', 'metrics', value => { metrics.value = value }))
-      if (page.value !== 'configuration') work.push(fetchPart('images', 'images', value => { images.value = value.images }))
-      if (page.value === 'runs') {
+      const stage = selectedJob.value?.stage
+      if (!jobConfig.value && stage && stage !== 'cache' && page.value !== 'configuration') work.push(fetchPart('jobConfig', 'config', value => { jobConfig.value = value.config }))
+      if (stage === 'train' && (page.value === 'overview' || page.value === 'runs')) work.push(fetchPart('metrics', 'metrics', value => { metrics.value = value }))
+      if (stage && stage !== 'cache' && page.value !== 'configuration') work.push(fetchPart('images', 'images', value => { images.value = value.images; imagesTruncated.value = value.truncated === true }))
+      if (page.value === 'runs' || page.value === 'evaluations') {
         const offset = logOffset.value
         work.push(fetchPart('logs', `logs?offset=${offset}`, value => {
           if (value.offset < offset) logs.value = ''
@@ -147,7 +182,8 @@ export function useWorkbench() {
         attempt('jobs', async () => {
           const data = await request('/jobs')
           jobs.value = data.jobs
-          if (!selectedId.value && jobs.value.length) selectedId.value = jobs.value[0].id
+          const selected = jobs.value.find(job => job.id === selectedId.value)
+          if (!selected || page.value === 'evaluations' && selected.stage !== 'evaluation' || page.value === 'runs' && selected.stage === 'evaluation') selectedId.value = jobs.value.find(job => page.value === 'evaluations' ? job.stage === 'evaluation' : page.value === 'runs' ? job.stage !== 'evaluation' : true)?.id || ''
           lastSuccess.value = new Date().toISOString()
         }),
         attempt('system', async () => { system.value = await request('/system') }),
@@ -156,15 +192,16 @@ export function useWorkbench() {
     } finally { polling = false }
   }
   function stageError(stage) {
-    if (!config.value) return '请先加载配置。'
+    const draft = stage === 'evaluation' ? evaluationConfig.value : config.value
+    if (!draft) return stage === 'evaluation' ? '请先显式初始化独立评估配置。' : '请先加载配置。'
     if (activeJobs.value.length) return '已有活动 GPU 任务；完成或显式停止后再启动。'
     if (stage === 'train' && options.resume.trim()) return ''
-    if (typeof config.value.model_dir !== 'string' || !config.value.model_dir.trim()) return '请在配置中填写模型目录。'
-    if (stage === 'cache' && !config.value.dataset?.image_dir) return '请填写 dataset.image_dir。'
+    if (typeof draft.model_dir !== 'string' || !draft.model_dir.trim()) return '请填写模型目录。'
+    if (stage === 'cache' && !draft.dataset?.image_dir) return '请填写 dataset.image_dir。'
     if (stage === 'train' && !options.cacheDir.trim()) return '请填写已完成的缓存目录。'
-    if (stage === 'sample') {
-      if (options.sampleMode !== 'base' && !options.adapter.trim()) return '适配器 / 对照模式需要检查点路径。'
-      const sample = config.value.sample
+    if (stage === 'evaluation') {
+      if (!evaluationOptions.includeBase && !evaluationOptions.adapters.length) return '请至少选择基座或一个 LoRA 检查点。'
+      const sample = draft.sample
       const prompts = typeof sample?.prompt === 'string' ? [sample.prompt] : sample?.prompt
       if (!Array.isArray(prompts) || !prompts.length || prompts.some(prompt => typeof prompt !== 'string' || !prompt.trim())) return '请填写每一行提示词；空行不会被静默丢弃。'
       if (typeof sample.negative_prompt !== 'string') return '共享负向提示词必须为文本，可为空。'
@@ -181,14 +218,15 @@ export function useWorkbench() {
     launching.value = stage
     try {
       await attempt('launch', async () => {
-        const payload = { stage, config: clone(config.value), name: options[`${stage}Name`] || undefined, output_dir: options.outputParent.trim() || undefined }
+        const evaluation = stage === 'evaluation'
+        const payload = { stage, config: clone(evaluation ? evaluationConfig.value : config.value), name: (evaluation ? evaluationOptions.name : options[`${stage}Name`]) || undefined, output_dir: (evaluation ? evaluationOptions.outputParent : options.outputParent).trim() || undefined }
         if (stage === 'cache') payload.cache_dir = options.cacheParent.trim() || undefined
         if (stage === 'train') { payload.cache_dir = options.cacheDir.trim() || undefined; payload.resume = options.resume.trim() || undefined }
-        if (stage === 'sample') { payload.sample_mode = options.sampleMode; payload.adapter = options.sampleMode === 'base' ? undefined : options.adapter.trim() }
+        if (evaluation) { payload.adapters = [...evaluationOptions.adapters]; payload.include_base = evaluationOptions.includeBase }
         const job = await request('/jobs', { method: 'POST', body: JSON.stringify(payload) })
         jobs.value = [job, ...jobs.value.filter(item => item.id !== job.id)]
         selectedId.value = job.id
-        page.value = 'runs'
+        page.value = evaluation ? 'evaluations' : 'runs'
         ElMessage.success('任务已提交；使用独立配置快照与新输出目录。')
         await refreshDetails()
       })
@@ -237,19 +275,51 @@ export function useWorkbench() {
       catch { return }
     }
     config.value = clone(snapshot.value.config)
+    configDraftToken.value = {}
     configRecord.value = { name: '任务快照', path: snapshot.value.path }
     baseline.value = JSON.stringify(config.value)
     snapshotDialog.value = false
     page.value = 'configuration'
+  }
+  async function initializeEvaluation(job = null, checkpointPath = null) {
+    if (evaluationLoading.value) return
+    if (evaluationDirty.value) {
+      try { await ElMessageBox.confirm('初始化会替换当前独立评估草稿；训练配置和历史文件保持不变。继续？', '替换评估草稿', { confirmButtonText: '初始化独立草稿', cancelButtonText: '保留草稿', type: 'warning' }) }
+      catch { return }
+    }
+    evaluationLoading.value = true
+    try {
+      let source = config.value
+      let origin = `训练表单的独立副本 · ${configurationName.value}`
+      if (job || checkpointPath) {
+        const result = await attempt('evaluationConfig', () => request(checkpointPath ? `/checkpoints/config?path=${encodeURIComponent(checkpointPath)}` : `/jobs/${encodeURIComponent(job.id)}/config`))
+        if (!result) return
+        source = result.config
+        origin = checkpointPath ? `检查点配置的独立副本 · ${checkpointPath}` : `训练任务快照 · ${job.name || job.id}`
+      }
+      if (!source) { errors.evaluationConfig = '请先加载训练配置，或选择已完成训练任务。'; return }
+      evaluationConfig.value = clone(source)
+      evaluationDraftToken.value = {}
+      evaluationBaseline.value = JSON.stringify(source)
+      evaluationOrigin.value = origin
+      if (job) {
+        await refreshCheckpoints()
+        const root = `${job.output_dir.replace(/\\/g, '/').replace(/\/$/, '')}/`.toLowerCase()
+        evaluationOptions.adapters = checkpoints.value.filter(item => item.path.replace(/\\/g, '/').toLowerCase().startsWith(root)).map(item => item.path)
+        if (!evaluationOptions.adapters.length) ElMessage.warning('未发现该训练输出中的已保存检查点；请从目录选择或显式添加实际路径。不会重建未保存状态。')
+        evaluationOptions.name = `${job.name || 'train'}-evaluation`
+      }
+      page.value = 'evaluations'
+    } finally { evaluationLoading.value = false }
   }
   function useCache(job) {
     options.cacheDir = job.cache_dir || ''
     page.value = 'runs'
     ElMessage.success('已填入训练缓存路径。')
   }
-  function beforeUnload(event) { if (dirty.value) { event.preventDefault(); event.returnValue = '' } }
+  function beforeUnload(event) { if (dirty.value || evaluationDirty.value) { event.preventDefault(); event.returnValue = '' } }
   function onVisible() { if (!document.hidden) poll() }
   onMounted(() => { initialize(); timer = setInterval(poll, 2000); document.addEventListener('visibilitychange', onVisible); window.addEventListener('beforeunload', beforeUnload) })
   onBeforeUnmount(() => { disposed = true; clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); window.removeEventListener('beforeunload', beforeUnload) })
-  return { page, theme, info, schema, configs, configRecord, config, jobs, selectedId, selectedJob, activeJobs, system, metrics, images, logs, logTrimmed, now, lastSuccess, initializing, loadingConfig, launching, stopping, saving, errors, errorList, saveDialog, revisionName, stopTarget, snapshot, snapshotDialog, snapshotLoading, options, dirty, newestMetric, configurationName, initialize, loadConfig, refreshConfigs, poll, stageError, launch, confirmStop, saveRevision, viewSnapshot, loadSnapshot, useCache }
+  return { page, theme, info, schema, configs, configRecord, config, configDraftToken, evaluationConfig, evaluationDraftToken, evaluationOrigin, evaluationLoading, evaluationOptions, checkpoints, checkpointsLoading, jobConfig, jobs, selectedId, selectedJob, activeJobs, system, metrics, images, imagesTruncated, logs, logTrimmed, now, lastSuccess, initializing, loadingConfig, launching, stopping, saving, errors, errorList, saveDialog, revisionName, stopTarget, snapshot, snapshotDialog, snapshotLoading, options, dirty, newestMetric, configurationName, initialize, loadConfig, refreshConfigs, refreshCheckpoints, initializeEvaluation, poll, stageError, launch, confirmStop, saveRevision, viewSnapshot, loadSnapshot, useCache }
 }

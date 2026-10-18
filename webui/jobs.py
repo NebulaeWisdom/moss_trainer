@@ -21,6 +21,90 @@ from .config import (
 TERMINAL = {"completed", "failed", "stopped", "interrupted"}
 JOB_ID = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{32}$")
 _THREAD_LOCK = threading.RLock()
+MAX_CHECKPOINT_ENTRIES = 10000
+MAX_CHECKPOINTS = 500
+MAX_CHECKPOINT_HEADER = 4 * 1024 * 1024
+CHECKPOINT_NAME = re.compile(r"^(?:adapter|step([0-9]+))\.safetensors$", re.IGNORECASE)
+
+
+def checkpoint_path(value: str) -> Path:
+    if not value.strip():
+        raise InputError("检查点路径不能为空。")
+    path = safe_path(value)
+    if path.suffix.lower() != ".safetensors" or not path.is_file():
+        raise InputError(f"检查点必须是工作区内实际存在的 .safetensors 文件: {path}")
+    return path
+
+
+def checkpoint_metadata(path: Path) -> dict:
+    """Read only the bounded safetensors JSON header, never tensors or pickle."""
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(8)
+            size = int.from_bytes(prefix, "little")
+            if len(prefix) != 8 or not 2 <= size <= MAX_CHECKPOINT_HEADER:
+                raise InputError(f"检查点头无效或超过 4 MiB 上限: {path.name}")
+            payload = handle.read(size)
+            if len(payload) != size:
+                raise InputError(f"检查点尚未写完或文件损坏: {path.name}")
+            header = json.loads(payload)
+            if not isinstance(header, dict):
+                raise ValueError("header is not an object")
+            data_bytes = os.fstat(handle.fileno()).st_size - 8 - size
+            tensors = [value for key, value in header.items() if key != "__metadata__"]
+            if not tensors or any(not isinstance(value, dict) or not isinstance(value.get("data_offsets"), list) or len(value["data_offsets"]) != 2 or any(type(offset) is not int for offset in value["data_offsets"]) or not 0 <= value["data_offsets"][0] <= value["data_offsets"][1] <= data_bytes for value in tensors):
+                raise ValueError("tensor data is incomplete")
+            metadata = header.get("__metadata__", {})
+            return metadata if isinstance(metadata, dict) else {}
+    except (UnicodeError, ValueError) as exc:
+        raise InputError(f"检查点头无效或文件尚未写完: {path.name}: {exc}") from exc
+
+
+def checkpoint_config(value: str) -> dict:
+    checkpoint = checkpoint_path(value)
+    checkpoint_metadata(checkpoint)
+    path = safe_path(checkpoint.parent / "config.json")
+    if not path.is_file():
+        raise InputError(f"检查点同目录没有 config.json；请显式配置匹配的评估模型与适配器参数: {checkpoint.parent}")
+    return {"config": validate_config(read_json(path)), "path": str(path)}
+
+
+def validate_checkpoint_config(path: Path, config: dict) -> None:
+    metadata = checkpoint_metadata(path)
+    adapter = config["adapter"]
+    conflicts = []
+    for key, expected in (("ss_arch", "MOSSImageTransformer"), ("ss_model_type", "MOSSImage"), ("ss_network_module", f"lycoris.{adapter['algo']}")):
+        if key in metadata and metadata[key] != expected:
+            conflicts.append(key)
+    for key, expected in (("ss_network_dim", adapter["rank"]), ("ss_network_alpha", adapter["alpha"])):
+        if key in metadata:
+            try:
+                matches = float(metadata[key]) == float(expected)
+            except (TypeError, ValueError):
+                matches = False
+            if not matches:
+                conflicts.append(key)
+    if isinstance(metadata.get("ss_network_args"), str):
+        try:
+            arguments = json.loads(metadata["ss_network_args"])
+        except ValueError as exc:
+            raise InputError(f"检查点适配器元数据不是有效 JSON: {path.name}") from exc
+        if isinstance(arguments, dict):
+            expected_arguments = {"algo": adapter["algo"], "target_modules": adapter["target_modules"], **adapter.get("kwargs", {})}
+            for key, value in arguments.items():
+                if key != "dropout" and (key not in expected_arguments or expected_arguments[key] != value):
+                    conflicts.append("ss_network_args." + key)
+    sibling = safe_path(path.parent / "config.json")
+    if sibling.is_file():
+        source = read_json(sibling)
+        source_adapter = source.get("adapter", {}) if isinstance(source, dict) else {}
+        if not isinstance(source_adapter, dict):
+            raise InputError(f"检查点同目录 config.json 的 adapter 必须为对象: {path.parent}")
+        for key in ("algo", "rank", "alpha", "target_modules", "kwargs"):
+            if source_adapter.get(key, {} if key == "kwargs" else None) != adapter.get(key, {} if key == "kwargs" else None):
+                conflicts.append("adapter." + key)
+    if conflicts:
+        raise InputError(f"检查点 {path.name} 与当前评估配置不匹配 ({', '.join(conflicts)})。所有来源共享一套适配器结构；请加载匹配配置或分开评估，不能跳过不兼容来源。")
 
 
 def python_path() -> Path:
@@ -150,7 +234,13 @@ def owned_processes(state: dict, *, include_supervisor: bool = False) -> list[ps
 
 
 def public_job(state: dict) -> dict:
-    return {key: value for key, value in state.items() if key not in {"supervisor", "child", "descendants", "launch_time", "resume_source"}}
+    result = {key: value for key, value in state.items() if key not in {"supervisor", "child", "descendants", "launch_time", "resume_source"}}
+    if result["stage"] == "sample":
+        # Read compatibility only: immutable historical job files remain unchanged.
+        mode = result.pop("sample_mode", "adapter")
+        adapter = result.pop("adapter", None)
+        result.update(stage="evaluation", adapters=[adapter] if adapter and mode != "base" else [], include_base=mode in {"base", "compare"})
+    return result
 
 
 def detached_options() -> dict:
@@ -205,6 +295,70 @@ class JobStore:
             state = {**state, "status": "stopping" if safe_path(directory / "stop.request").exists() else "running", "error": "监督进程已退出；已记录的训练子进程仍在运行，可显式停止。"}
         return state
 
+    def checkpoints(self) -> dict:
+        project_runs = safe_path(PROJECT_DIR / "runs")
+        names = {}
+        roots = [project_runs] if project_runs.is_dir() else []
+        for state in self.states():
+            if state["stage"] != "train":
+                continue
+            try:
+                root = safe_path(state["output_dir"])
+            except InputError:
+                continue
+            names[root] = state["name"]
+            if root.is_dir() and not any(root.is_relative_to(existing) for existing in roots):
+                roots.append(root)
+        pending = list(reversed(roots))
+        seen = set()
+        result = []
+        scanned = 0
+        header_bytes = 0
+        truncated = False
+        while pending and not truncated:
+            directory = pending.pop()
+            if directory in seen:
+                continue
+            seen.add(directory)
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        scanned += 1
+                        if scanned > MAX_CHECKPOINT_ENTRIES or len(result) >= MAX_CHECKPOINTS:
+                            truncated = True
+                            break
+                        try:
+                            path = safe_path(entry.path)
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(path)
+                                continue
+                            match = CHECKPOINT_NAME.fullmatch(entry.name)
+                            if match is None or not entry.is_file(follow_symlinks=False):
+                                continue
+                            with path.open("rb") as handle:
+                                header_size = int.from_bytes(handle.read(8), "little")
+                            header_bytes += min(header_size, MAX_CHECKPOINT_HEADER)
+                            if header_bytes > 64 * 1024 * 1024:
+                                truncated = True
+                                break
+                            metadata = checkpoint_metadata(path)
+                            if metadata.get("ss_arch") != "MOSSImageTransformer" and metadata.get("ss_model_type") != "MOSSImage":
+                                continue
+                            item = {"path": str(path), "name": path.name, "run_name": names.get(path.parent, path.parent.name)}
+                            step = match.group(1) if match.group(1) is not None else metadata.get("ss_training_steps")
+                            if isinstance(step, (str, int)) and str(step).isdigit():
+                                item["step"] = int(step)
+                            config_path = safe_path(path.parent / "config.json")
+                            if config_path.is_file():
+                                item["config_path"] = str(config_path)
+                            result.append(item)
+                        except (InputError, OSError):
+                            continue
+            except OSError:
+                continue
+        result.sort(key=lambda item: (item["run_name"], item.get("step", -1), item["name"]), reverse=True)
+        return {"checkpoints": result, "truncated": truncated}
+
     def create(self, request: dict) -> dict:
         from ..launch import CACHE_ENVIRONMENT, TEMP
 
@@ -215,8 +369,10 @@ class JobStore:
         resume = request.get("resume")
         if resume and stage != "train":
             raise InputError("resume 仅用于训练。")
-        if stage != "sample" and request.get("adapter"):
-            raise InputError("adapter 路径仅用于独立采样。训练适配器设置位于 config.adapter。")
+        if stage != "evaluation" and (request.get("adapters") or request.get("include_base")):
+            raise InputError("adapters/include_base 仅用于独立 LoRA 评估；训练适配器设置位于 config.adapter。")
+        if stage == "evaluation" and request.get("cache_dir"):
+            raise InputError("LoRA 评估不使用训练缓存，请移除 cache_dir。")
         cache = None
         resume_source = None
         if resume:
@@ -252,15 +408,22 @@ class JobStore:
             for filename in ("manifest.json", "text_manifest.json", "latent_stats.safetensors"):
                 if not (cache / filename).is_file():
                     raise InputError(f"缓存不完整，缺少 {filename}: {cache}")
-        mode = request.get("sample_mode") or "adapter"
-        adapter = None
-        if stage == "sample" and mode != "base":
-            adapter = input_path(request.get("adapter"), "adapter")
-            if adapter.suffix.lower() != ".safetensors":
-                raise InputError("adapter 必须是 .safetensors 权重文件。")
-            missing = [key for key in ("algo", "rank", "alpha", "target_modules", "dropout") if key not in config.get("adapter", {})]
-            if missing:
-                raise InputError("采样适配器缺少配置字段: " + ", ".join("adapter." + key for key in missing))
+        adapters = []
+        include_base = request.get("include_base", False)
+        if stage == "evaluation":
+            for value in request.get("adapters", []):
+                path = checkpoint_path(value)
+                if path in adapters:
+                    raise InputError(f"评估来源重复: {path}。请保留一次；输入顺序即矩阵列顺序。")
+                adapters.append(path)
+            if not include_base and not adapters:
+                raise InputError("评估至少选择基模或一个适配器检查点。")
+            if adapters:
+                missing = [key for key in ("algo", "rank", "alpha", "target_modules", "dropout") if key not in config.get("adapter", {})]
+                if missing:
+                    raise InputError("评估适配器缺少配置字段: " + ", ".join("adapter." + key for key in missing))
+                for path in adapters:
+                    validate_checkpoint_config(path, config)
         parent = safe_path(request.get("output_dir") or DEFAULT_OUTPUT_ROOT)
         if parent.exists() and not parent.is_dir():
             raise InputError(f"输出父路径不是目录: {parent}")
@@ -291,13 +454,15 @@ class JobStore:
                 command += ["--output-dir", str(output)]
             else:
                 command = [str(python_path()), "-u", "-m", "moss_trainer.samples", "--config", str(snapshot)]
-                if adapter is not None:
-                    command += ["--adapter", str(adapter)]
-                command += ["--multiplier", *({"base": ["0"], "adapter": ["1"], "compare": ["0", "1"]}[mode]), "--output-dir", str(output)]
+                if adapters:
+                    command += ["--adapter", *(str(path) for path in adapters)]
+                multipliers = (["0"] if include_base else []) + (["1"] if adapters else [])
+                command += ["--multiplier", *multipliers, "--output-dir", str(output)]
             state = {"id": identifier, "name": request.get("name") or f"{stage}-{identifier}", "stage": stage, "status": "queued", "created_at": utc_now(), "launch_time": time.time(), "config_path": str(snapshot), "output_dir": str(output), "command": command, "cache_dir": str(cache) if cache else None, "pid": None, "exit_code": None}
-            if stage == "sample":
-                state["sample_mode"] = mode
-                state["adapter"] = str(adapter) if adapter else None
+            if stage == "evaluation":
+                state["adapters"] = [str(path) for path in adapters]
+                state["include_base"] = include_base
+                state["compatibility_note"] = "所有检查点共享此评估配置的基础模型与适配器结构（算法、rank、alpha、目标模块及 kwargs）；已知元数据冲突会拒绝，最终张量兼容性由训练器 strict=True 加载验证，失败不会跳过来源。"
             if resume:
                 state["resume"] = str(resume_path)
                 state["resume_source"] = resume_source["id"] if resume_source else None

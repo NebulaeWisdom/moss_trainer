@@ -10,14 +10,17 @@ import struct
 from pathlib import Path
 
 from .config import InputError, read_json, safe_path
-from .jobs import job_directory
+from .jobs import job_directory, public_job
 
 MAX_LOG_CHUNK = 128 * 1024
 MAX_METRIC_BYTES = 4 * 1024 * 1024
 MAX_METRIC_ROWS = 5000
 MAX_IMAGES = 500
 MAX_SCANNED_FILES = 10000
-PNG_NAMES = re.compile(r"^(?:preview[0-9]+(?:_[0-9]+)?|prompt[0-9]+_seed-?[0-9]+_(?:base|adapter[0-9]+_.+)|base|lora)\.png$", re.IGNORECASE)
+PREVIEW_NAME = re.compile(r"^preview(?P<step>[0-9]+)(?:_(?P<index>[0-9]+))?\.png$", re.IGNORECASE)
+EVALUATION_NAME = re.compile(r"^prompt(?P<index>[0-9]+)_seed(?P<seed>-?[0-9]+)_(?:base|adapter(?P<adapter_index>[0-9]+)_.+_m(?P<multiplier>-?[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?))\.png$", re.IGNORECASE)
+SAMPLING_FIELDS = ("negative_prompt", "seed", "width", "height", "num_inference_steps", "guidance_scale")
+PROBE_FIELDS = ("prompt_index", "prompt", *SAMPLING_FIELDS)
 
 
 def logs(identifier: str, offset: int) -> dict:
@@ -63,6 +66,8 @@ def jsonl_tail(path: Path) -> tuple[list[dict], bool]:
 
 
 def metric_rows(job: dict) -> dict:
+    if job["stage"] != "train":
+        return {"series": [], "columns": [], "source": None, "truncated": False}
     path = safe_path(Path(job["output_dir"]) / "train.jsonl")
     records, truncated = jsonl_tail(path)
     series = []
@@ -89,43 +94,109 @@ def metric_rows(job: dict) -> dict:
 def metadata_index(job: dict) -> dict[str, dict]:
     root = safe_path(job["output_dir"])
     metadata = {}
-    parameters = safe_path(root / "parameters.json")
-    if parameters.is_file():
-        try:
-            document = read_json(parameters)
-            for item in document.get("images", []):
-                if not isinstance(item, dict) or not isinstance(item.get("path"), str):
-                    continue
-                candidate = safe_path(item["path"], root=root)
-                data = {**document.get("sample", {}), **item}
-                prompts = document.get("prompts", [])
-                index = item.get("prompt_index")
-                if type(index) is int and 0 <= index < len(prompts):
-                    data["prompt"] = prompts[index]
-                data["negative_prompt"] = document.get("negative_prompt")
-                metadata[str(candidate)] = data
-        except (OSError, InputError, TypeError, AttributeError):
-            pass  # Partial parameter files are expected while a sample job finishes.
+    if job["stage"] in {"evaluation", "sample"}:
+        parameters = safe_path(root / "parameters.json")
+        if parameters.is_file():
+            try:
+                document = read_json(parameters)
+                for item in document.get("images", []):
+                    if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                        continue
+                    candidate = safe_path(item["path"], root=root)
+                    data = {**document.get("sample", {}), **item, "kind": "evaluation", "metadata_source": "parameters.json"}
+                    prompts = document.get("prompts", [])
+                    index = item.get("prompt_index")
+                    if type(index) is int and 0 <= index < len(prompts):
+                        data["prompt"] = prompts[index]
+                    data["negative_prompt"] = document.get("negative_prompt")
+                    metadata[str(candidate)] = data
+            except (OSError, InputError, TypeError, AttributeError):
+                pass  # The matrix remains incomplete until actual images/metadata arrive.
+        return metadata
+    if job["stage"] != "train":
+        return metadata
     records, _ = jsonl_tail(safe_path(root / "train.jsonl"))
     for record in records:
         if record.get("event") != "preview" or not isinstance(record.get("preview"), dict):
             continue
         preview = record["preview"]
-        for item in preview.get("outputs", [preview]):
+        for index, item in enumerate(preview.get("outputs", [preview])):
             if not isinstance(item, dict) or not isinstance(item.get("output_path"), str):
                 continue
             try:
                 candidate = safe_path(item["output_path"], root=root)
             except InputError:
                 continue
-            metadata[str(candidate)] = {**item, "step": record.get("step"), "epoch": record.get("epoch")}
+            metadata[str(candidate)] = {**item, "prompt_index": index, "kind": "training_preview", "metadata_source": "train.jsonl", "step": record.get("step"), "epoch": record.get("epoch")}
     return metadata
 
 
-def image_paths(job: dict) -> list[Path]:
+def sampling_snapshot(job: dict) -> dict:
+    try:
+        config = read_json(safe_path(job["config_path"]))
+        sample = config.get("sample", {})
+        return sample if isinstance(sample, dict) else {}
+    except (OSError, InputError, AttributeError):
+        return {}
+
+
+def enrich_image(job: dict, path: Path, sample: dict, recorded: dict) -> dict:
+    """Attach actual provenance; filenames recover indices without merging equal prompts."""
+    data = {key: sample[key] for key in SAMPLING_FIELDS if key in sample}
+    prompts = sample.get("prompt")
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    if not isinstance(prompts, list):
+        prompts = []
+    if job["stage"] == "train":
+        match = PREVIEW_NAME.fullmatch(path.name)
+        if match is not None:
+            data.update(step=int(match["step"]), prompt_index=int(match["index"] or 0))
+        data.update({key: value for key, value in recorded.items() if value is not None})
+        index = data.get("prompt_index")
+        if type(index) is int and 0 <= index < len(prompts) and isinstance(prompts[index], str):
+            data["prompt"] = prompts[index]
+        data["kind"] = "training_preview"
+        data.setdefault("metadata_source", "filename+config_snapshot")
+        data["probe_complete"] = all(key in data and data[key] is not None for key in PROBE_FIELDS)
+        identity = {key: data.get(key) for key in PROBE_FIELDS}
+        if not data["probe_complete"]:
+            # Unknown provenance must never silently merge into a compatible probe row.
+            identity["unresolved_image"] = f"{job['id']}/{path.name}"
+        data["probe_id"] = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True, allow_nan=False).encode("utf-8")).hexdigest()[:24]
+        return data
+    data.update(kind="evaluation", metadata_source="filename+config_snapshot")
+    match = EVALUATION_NAME.fullmatch(path.name)
+    if match is not None:
+        index = int(match["index"])
+        data.update(prompt_index=index, seed=int(match["seed"]))
+        if match["adapter_index"] is None:
+            data.update(multiplier=0.0, adapter_index=None, source_checkpoint=None)
+        else:
+            adapter_index = int(match["adapter_index"])
+            data.update(multiplier=float(match["multiplier"]), adapter_index=adapter_index)
+            if adapter_index < len(job.get("adapters", [])):
+                data["source_checkpoint"] = job["adapters"][adapter_index]
+    elif path.name.lower() in {"base.png", "lora.png"}:
+        # Earlier paired CLI output used a promptNNN subdirectory for list prompts.
+        parent_match = re.fullmatch(r"prompt([0-9]+)", path.parent.name)
+        if parent_match is not None or len(prompts) == 1:
+            data["prompt_index"] = int(parent_match[1]) if parent_match else 0
+        if path.name.lower() == "base.png":
+            data.update(multiplier=0.0, adapter_index=None, source_checkpoint=None)
+        elif job.get("adapters"):
+            data.update(multiplier=1.0, adapter_index=0, source_checkpoint=job["adapters"][0])
+    index = data.get("prompt_index")
+    if type(index) is int and 0 <= index < len(prompts) and isinstance(prompts[index], str):
+        data["prompt"] = prompts[index]
+    data.update(recorded)
+    return data
+
+
+def image_paths(job: dict) -> tuple[list[Path], bool]:
     root = safe_path(job["output_dir"])
     if job["stage"] == "cache" or not root.is_dir():
-        return []
+        return [], False
     candidates = []
     scanned = 0
     for directory, directories, filenames in os.walk(root, followlinks=False):
@@ -133,7 +204,7 @@ def image_paths(job: dict) -> list[Path]:
         for name in directories:
             scanned += 1
             if scanned > MAX_SCANNED_FILES:
-                return sorted(candidates, key=lambda item: item.stat().st_mtime_ns, reverse=True)[:MAX_IMAGES]
+                return [path for _, path in sorted(candidates, reverse=True)[:MAX_IMAGES]], True
             try:
                 safe_path(Path(directory) / name, root=root)
                 allowed.append(name)
@@ -143,16 +214,17 @@ def image_paths(job: dict) -> list[Path]:
         for name in filenames:
             scanned += 1
             if scanned > MAX_SCANNED_FILES:
-                return sorted(candidates, key=lambda item: item.stat().st_mtime_ns, reverse=True)[:MAX_IMAGES]
-            if not PNG_NAMES.fullmatch(name):
+                return [path for _, path in sorted(candidates, reverse=True)[:MAX_IMAGES]], True
+            accepted = PREVIEW_NAME.fullmatch(name) if job["stage"] == "train" else EVALUATION_NAME.fullmatch(name) or name.lower() in {"base.png", "lora.png"}
+            if not accepted:
                 continue
             try:
                 path = safe_path(Path(directory) / name, root=root)
                 if path.is_file():
-                    candidates.append(path)
+                    candidates.append((path.stat().st_mtime_ns, path))
             except (OSError, InputError):
                 continue
-    return sorted(candidates, key=lambda item: item.stat().st_mtime_ns, reverse=True)[:MAX_IMAGES]
+    return [path for _, path in sorted(candidates, reverse=True)[:MAX_IMAGES]], len(candidates) > MAX_IMAGES
 
 
 def image_id(job: dict, path: Path) -> str:
@@ -160,9 +232,14 @@ def image_id(job: dict, path: Path) -> str:
 
 
 def gallery(job: dict) -> dict:
+    job = public_job(job)
+    if job["stage"] == "cache":
+        return {"images": [], "truncated": False}
     metadata = metadata_index(job)
+    sample = sampling_snapshot(job)
+    paths, truncated = image_paths(job)
     result = []
-    for path in image_paths(job):
+    for path in paths:
         try:
             with path.open("rb") as handle:
                 header = handle.read(24)
@@ -172,14 +249,16 @@ def gallery(job: dict) -> dict:
         except OSError:
             continue
         identifier = image_id(job, path)
-        result.append({"id": identifier, "name": path.name, "url": f"/api/jobs/{job['id']}/images/{identifier}", "width": width, "height": height, "metadata": metadata.get(str(path), {})})
-    return {"images": result}
+        enriched = enrich_image(job, path, sample, metadata.get(str(path), {}))
+        result.append({"id": identifier, "name": path.name, "url": f"/api/jobs/{job['id']}/images/{identifier}", "width": width, "height": height, "metadata": enriched})
+    return {"images": result, "truncated": truncated}
 
 
 def resolve_image(job: dict, identifier: str) -> Path:
     if not re.fullmatch(r"[0-9a-f]{32}", identifier):
         raise KeyError("图片不存在。")
-    for path in image_paths(job):
+    paths, _ = image_paths(job)
+    for path in paths:
         if image_id(job, path) == identifier:
             with path.open("rb") as handle:
                 if handle.read(8) != b"\x89PNG\r\n\x1a\n":

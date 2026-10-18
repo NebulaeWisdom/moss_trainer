@@ -18,7 +18,7 @@ from .config import (
     DEFAULT_OUTPUT_ROOT, MAX_JSON_BYTES, PROJECT_DIR, STATE_DIR, WORKSPACE_DIR,
     ConfigStore, InputError, read_json, safe_path, schema,
 )
-from .jobs import JobStore, public_job, python_path
+from .jobs import JobStore, checkpoint_config, public_job, python_path
 from .telemetry import SystemMonitor
 
 
@@ -104,13 +104,13 @@ class RevisionRequest(BaseModel):
 
 class JobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    stage: Literal["cache", "train", "sample"]
+    stage: Literal["cache", "train", "evaluation"]
     config: dict[str, Any]
     name: str | None = Field(default=None, max_length=128)
     cache_dir: str | None = None
     output_dir: str | None = None
-    sample_mode: Literal["base", "adapter", "compare"] | None = None
-    adapter: str | None = None
+    adapters: list[str] = Field(default_factory=list)
+    include_base: bool = False
     resume: str | None = None
 
 
@@ -145,7 +145,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/info")
     def info():
-        return {"project_dir": str(PROJECT_DIR), "workspace_dir": str(WORKSPACE_DIR), "python": str(python_path()), "state_dir": str(STATE_DIR), "default_output_root": str(DEFAULT_OUTPUT_ROOT), "stages": ["cache", "train", "sample"]}
+        return {"project_dir": str(PROJECT_DIR), "workspace_dir": str(WORKSPACE_DIR), "python": str(python_path()), "state_dir": str(STATE_DIR), "default_output_root": str(DEFAULT_OUTPUT_ROOT), "stages": ["cache", "train"], "evaluation_stage": "evaluation"}
 
     @app.get("/api/schema")
     def config_schema():
@@ -164,6 +164,14 @@ def create_app() -> FastAPI:
     @app.post("/api/configs", status_code=201)
     def save_config(request: RevisionRequest):
         return configs.save(request.name, request.config)
+
+    @app.get("/api/checkpoints")
+    def list_checkpoints():
+        return jobs.checkpoints()
+
+    @app.get("/api/checkpoints/config")
+    def get_checkpoint_config(path: str = Query(...)):
+        return checkpoint_config(path)
 
     @app.get("/api/jobs")
     def list_jobs():

@@ -28,6 +28,35 @@ CACHE_ENVIRONMENT = {
 STAGES = {"cache": "runtime", "train": "train", "sample": "sample"}
 
 
+def resolve_model_paths(config: dict, *, base_dir: Path | None = None) -> dict[str, Path]:
+    """Resolve component directories without importing model or UI dependencies."""
+    base_dir = Path.cwd() if base_dir is None else Path(base_dir).resolve()
+    root = config.get("model_dir")
+    if root is not None and not isinstance(root, str):
+        raise ValueError("model_dir must be a directory path string")
+    root = root.strip() if root else ""
+    model_dir = Path(root).expanduser() if root else None
+    overrides = config.get("model_paths")
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict):
+        raise ValueError("model_paths must be an object")
+    paths = {}
+    for component in ("transformer", "vae", "text_encoder", "tokenizer"):
+        override = overrides.get(component)
+        if override is not None and not isinstance(override, str):
+            raise ValueError(f"model_paths.{component} must be a directory path string or null")
+        override = override.strip() if override else ""
+        if override:
+            path = Path(override).expanduser()
+        elif model_dir is not None:
+            path = model_dir / component
+        else:
+            raise ValueError(f"model_dir is required when model_paths.{component} is not set")
+        paths[component] = (path if path.is_absolute() else base_dir / path).resolve()
+    return paths
+
+
 def configure_environment() -> None:
     """Redirect every toolchain cache into ``temp/`` and force offline model loading."""
     for variable, directory in CACHE_ENVIRONMENT.items():

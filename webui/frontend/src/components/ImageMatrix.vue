@@ -9,7 +9,7 @@ const imageA = ref('')
 const imageB = ref('')
 const meta = image => image.metadata || {}
 const normalizedPath = path => String(path || '').replace(/\\/g, '/').toLowerCase()
-const probeFields = ['prompt_index', 'prompt', 'negative_prompt', 'seed', 'width', 'height', 'num_inference_steps', 'guidance_scale']
+const probeFields = ['prompt_index', 'prompt', 'negative_prompt', 'seed', 'width', 'height', 'num_inference_steps', 'guidance_scale', 'scheduler', 'uncond_skip_layers', 'slg_layers', 'slg_scale', 'slg_start', 'slg_stop']
 const signature = data => JSON.stringify(probeFields.map(key => [key, data[key] ?? null]))
 const classified = computed(() => {
   const grouped = []

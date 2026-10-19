@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..launch import resolve_model_paths
+
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 WORKSPACE_DIR = PROJECT_DIR.parent
 STATE_DIR = PROJECT_DIR / ".webui"
@@ -92,6 +94,7 @@ def input_path(value: Any, label: str, *, directory: bool = False) -> Path:
 
 SECTIONS = [
     ("model_dir", "基础模型", "离线模型目录；只读，不下载模型。"),
+    ("model_paths", "模型组件目录", "可选独立目录；null 或空字符串继承模型根目录下的同名组件。"),
     ("dataset", "数据与分桶", "图像、描述与分辨率；几何或文本编码设置改变后需要新缓存。"),
     ("text", "文本编码", "冻结文本编码器的长度与显存/内存预算。"),
     ("adapter", "适配器", "LyCORIS LoRA / LoKr 参数；采样时必须匹配权重。"),
@@ -106,6 +109,11 @@ SECTIONS = [
 # Hints describe existing trainer fields; unknown JSON keys remain untouched.
 FIELD_HINTS = {
     "model_dir": ("模型目录", "包含 transformer、vae、text_encoder、tokenizer 的本地模型目录。"),
+    "model_paths": ("模型组件目录", "仅填写需要覆盖的组件目录，不是单个权重文件；其余继承模型根目录。"),
+    "model_paths.transformer": ("DiT 目录", "留空使用 <model_dir>/transformer；离线加载 BF16 DiT。"),
+    "model_paths.vae": ("VAE 目录", "留空使用 <model_dir>/vae；离线加载 FP32 VAE。"),
+    "model_paths.text_encoder": ("文本编码器目录", "留空使用 <model_dir>/text_encoder；离线加载 BF16 文本编码器。"),
+    "model_paths.tokenizer": ("Tokenizer 目录", "留空使用 <model_dir>/tokenizer；必须是 tokenizer 目录。"),
     "dataset.image_dir": ("图像目录", "递归读取训练图像。"),
     "dataset.caption": ("固定描述", "null 使用图像对应描述文件；字符串为固定描述。"),
     "dataset.caption_dir": ("描述目录", "null 使用图像所在目录。"),
@@ -169,12 +177,26 @@ FIELD_HINTS = {
     "sample.num_inference_steps": ("采样步数", "扩散采样迭代次数。"),
     "sample.guidance_scale": ("CFG", "提示词引导强度。"),
     "sample.seed": ("采样种子", "基模与适配器比较使用相同种子。"),
+    "sample.uncond_skip_layers": ("无条件分支跳层", "零起始 DiT block 索引，默认 [22]；空数组关闭跳层。实际模型检查索引上限。"),
+    "sample.slg_layers": ("SLG 跳层", "额外正向跳层分支的 block 索引；空数组关闭额外分支。"),
+    "sample.slg_scale": ("SLG 强度", "非负数；0 关闭额外分支。"),
+    "sample.slg_start": ("跳层起始比例", "按去噪顺序的起始位置；与结束比例满足 0 ≤ start ≤ stop ≤ 1。"),
+    "sample.slg_stop": ("跳层结束比例", "按去噪顺序的结束位置；区间外使用普通 CFG。"),
+    "sample.scheduler": ("MOSS 采样时间网格", "固定 MOSS V2 nearest-grid Euler；参数需与模型训练时的时间网格保持一致。"),
+    "sample.scheduler.num_train_timesteps": ("参考时间网格步数", "采样器参考网格的正整数长度，默认 1000；不是优化器训练步数。"),
+    "sample.scheduler.shift": ("采样时间偏移", "采样网格 shift，必须大于 0；默认 5.0。"),
+    "sample.scheduler.training_shift": ("参考网格偏移", "模型训练参考网格 training_shift，必须大于 0；不是优化器学习率调度。"),
 }
 
 # Types and insertion defaults follow TUTORIAL section 5, not the type of a
 # particular preset. Unlisted extension keys are deliberately not constrained.
 FIELD_RULES = {
     "model_dir": {"types": ["string"], "default": ""},
+    "model_paths": {"types": ["object"], "default": {"transformer": None, "vae": None, "text_encoder": None, "tokenizer": None}},
+    "model_paths.transformer": {"types": ["string", "null"], "default": None},
+    "model_paths.vae": {"types": ["string", "null"], "default": None},
+    "model_paths.text_encoder": {"types": ["string", "null"], "default": None},
+    "model_paths.tokenizer": {"types": ["string", "null"], "default": None},
     "dataset.image_dir": {"types": ["string"], "default": ""},
     "dataset.caption": {"types": ["string", "null"], "default": "deepseek-tan"},
     "dataset.caption_dir": {"types": ["string", "null"], "default": None},
@@ -192,9 +214,9 @@ FIELD_RULES = {
     "dataset.repeats": {"types": ["number"], "integer": True, "default": 1},
     "dataset.caption_dropout": {"types": ["number"], "default": 0.0},
     "dataset.seed": {"types": ["number"], "integer": True, "default": 42},
-    "text.max_sequence_length": {"types": ["number"], "integer": True, "default": 4096},
-    "text.gpu_memory_gib": {"types": ["number"], "default": 10},
-    "text.cpu_memory_gib": {"types": ["number"], "default": 48},
+    "text.max_sequence_length": {"types": ["number"], "integer": True, "default": 4096, "min": 1},
+    "text.gpu_memory_gib": {"types": ["number"], "default": 10, "exclusiveMinimum": 0},
+    "text.cpu_memory_gib": {"types": ["number"], "default": 48, "exclusiveMinimum": 0},
     "adapter.algo": {"types": ["string"], "default": "lora"},
     "adapter.rank": {"types": ["number"], "integer": True, "default": 8},
     "adapter.alpha": {"types": ["number"], "default": 8},
@@ -252,7 +274,33 @@ FIELD_RULES = {
     "sample.num_inference_steps": {"types": ["number"], "integer": True, "default": 20, "min": 1},
     "sample.guidance_scale": {"types": ["number"], "default": 3.0},
     "sample.seed": {"types": ["number"], "integer": True, "default": 42},
+    "sample.uncond_skip_layers": {"types": ["array"], "default": [22], "items": {"types": ["number"], "integer": True, "min": 0, "default": 0}},
+    "sample.slg_layers": {"types": ["array"], "default": [], "items": {"types": ["number"], "integer": True, "min": 0, "default": 0}},
+    "sample.slg_scale": {"types": ["number"], "default": 0.0, "min": 0},
+    "sample.slg_start": {"types": ["number"], "default": 0.0, "min": 0, "max": 1},
+    "sample.slg_stop": {"types": ["number"], "default": 1.0, "min": 0, "max": 1},
+    "sample.scheduler": {"types": ["object"], "default": {"num_train_timesteps": 1000, "shift": 5.0, "training_shift": 1.0}},
+    "sample.scheduler.num_train_timesteps": {"types": ["number"], "integer": True, "default": 1000, "min": 1},
+    "sample.scheduler.shift": {"types": ["number"], "default": 5.0, "exclusiveMinimum": 0},
+    "sample.scheduler.training_shift": {"types": ["number"], "default": 1.0, "exclusiveMinimum": 0},
 }
+
+
+def evaluation_defaults() -> dict:
+    """A fresh inference-only draft, independent of saved or current training configs."""
+    return {
+        "model_dir": "",
+        "model_paths": {"transformer": None, "vae": None, "text_encoder": None, "tokenizer": None},
+        "text": {"max_sequence_length": 4096, "gpu_memory_gib": 10, "cpu_memory_gib": 48},
+        "adapter": {"algo": "lora", "rank": 4, "alpha": 4, "target_modules": ["_Block"], "dropout": 0, "kwargs": {}},
+        "sample": {
+            "prompt": [""], "negative_prompt": "", "width": 832, "height": 1216,
+            "num_inference_steps": 20, "guidance_scale": 3, "seed": 42,
+            "uncond_skip_layers": [22], "slg_layers": [], "slg_scale": 0.0,
+            "slg_start": 0.0, "slg_stop": 1.0,
+            "scheduler": {"num_train_timesteps": 1000, "shift": 5.0, "training_shift": 1.0},
+        },
+    }
 
 
 def schema() -> dict:
@@ -279,6 +327,10 @@ def _validate_field(value: Any, path: str, rule: dict) -> None:
         raise InputError(f"{path} 必须是{'或'.join(labels[kind] for kind in rule['types'])}。")
     if kind == "number" and "min" in rule and value < rule["min"]:
         raise InputError(f"{path} 必须大于或等于 {rule['min']}。")
+    if kind == "number" and "max" in rule and value > rule["max"]:
+        raise InputError(f"{path} 必须小于或等于 {rule['max']}。")
+    if kind == "number" and "exclusiveMinimum" in rule and value <= rule["exclusiveMinimum"]:
+        raise InputError(f"{path} 必须大于 {rule['exclusiveMinimum']}。")
     if kind == "array":
         if len(value) < rule.get("minItems", 0):
             raise InputError(f"{path} 至少需要 {rule['minItems']} 项。")
@@ -308,22 +360,41 @@ def validate_config(config: Any, stage: str | None = None) -> dict:
         else:
             _validate_field(value, dotted, rule)
     sample = config.get("sample", {})
+    if sample.get("slg_start", 0.0) > sample.get("slg_stop", 1.0):
+        raise InputError("sample.slg_start 必须小于或等于 sample.slg_stop。")
     if stage is None:
         return config
     required = {
         "cache": {"dataset": ["image_dir", "resolutions", "caption_dropout"], "text": ["max_sequence_length", "gpu_memory_gib", "cpu_memory_gib"]},
-        "evaluation": {"training": [], "text": ["max_sequence_length", "gpu_memory_gib", "cpu_memory_gib"], "sample": ["prompt", "negative_prompt", "width", "height", "num_inference_steps", "guidance_scale", "seed"]},
+        "evaluation": {"text": ["max_sequence_length", "gpu_memory_gib", "cpu_memory_gib"], "sample": ["prompt", "negative_prompt", "width", "height", "num_inference_steps", "guidance_scale", "seed"]},
         "train": {"dataset": [], "adapter": ["algo", "rank", "alpha", "target_modules", "dropout"], "training": ["max_steps", "epochs", "batch_size", "gradient_accumulation", "seed", "gradient_checkpointing", "timestep_sampling", "logit_mean", "logit_std", "max_grad_norm"], "optimizer": ["type", "learning_rate", "weight_decay", "kwargs"], "scheduler": ["type", "warmup_steps"], "loader": [], "save": ["every_steps", "every_epochs", "save_state"]},
     }[stage]
     missing_sections = [section for section in required if section not in config]
     if missing_sections:
         raise InputError("配置缺少必需对象: " + ", ".join(missing_sections))
     missing = [f"{section}.{key}" for section, keys in required.items() for key in keys if key not in config.get(section, {})]
-    if "model_dir" not in config:
+    if stage != "evaluation" and "model_dir" not in config:
         missing.insert(0, "model_dir")
     if missing:
         raise InputError("配置缺少必需字段: " + ", ".join(missing))
-    input_path(config["model_dir"], "model_dir", directory=True)
+    if stage == "evaluation":
+        try:
+            components = resolve_model_paths(config, base_dir=WORKSPACE_DIR)
+        except (TypeError, ValueError) as exc:
+            raise InputError(f"评估模型路径无效: {exc}") from exc
+        for component, path in components.items():
+            if not path.is_dir():
+                raise InputError(f"model_paths.{component}: 组件目录不存在或不是目录: {path}")
+        # Normalize explicit overrides only; keep inherited defaults and extra keys.
+        config = {**config, "model_dir": config.get("model_dir", "").strip()}
+        if "model_paths" in config:
+            overrides = dict(config["model_paths"])
+            for component, path in components.items():
+                if component in overrides:
+                    overrides[component] = str(path) if isinstance(overrides[component], str) and overrides[component].strip() else None
+            config["model_paths"] = overrides
+    else:
+        input_path(config["model_dir"], "model_dir", directory=True)
     if stage == "cache":
         input_path(config["dataset"]["image_dir"], "dataset.image_dir", directory=True)
         if config["dataset"].get("caption_dir"):

@@ -9,7 +9,7 @@ import re
 import struct
 from pathlib import Path
 
-from .config import InputError, read_json, safe_path
+from .config import InputError, evaluation_defaults, read_json, safe_path
 from .jobs import job_directory, public_job
 
 MAX_LOG_CHUNK = 128 * 1024
@@ -19,7 +19,8 @@ MAX_IMAGES = 500
 MAX_SCANNED_FILES = 10000
 PREVIEW_NAME = re.compile(r"^preview(?P<step>[0-9]+)(?:_(?P<index>[0-9]+))?\.png$", re.IGNORECASE)
 EVALUATION_NAME = re.compile(r"^prompt(?P<index>[0-9]+)_seed(?P<seed>-?[0-9]+)_(?:base|adapter(?P<adapter_index>[0-9]+)_.+_m(?P<multiplier>-?[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?))\.png$", re.IGNORECASE)
-SAMPLING_FIELDS = ("negative_prompt", "seed", "width", "height", "num_inference_steps", "guidance_scale")
+OPTIONAL_SAMPLING_FIELDS = ("scheduler", "uncond_skip_layers", "slg_layers", "slg_scale", "slg_start", "slg_stop")
+SAMPLING_FIELDS = ("negative_prompt", "seed", "width", "height", "num_inference_steps", "guidance_scale", *OPTIONAL_SAMPLING_FIELDS)
 PROBE_FIELDS = ("prompt_index", "prompt", *SAMPLING_FIELDS)
 
 
@@ -99,11 +100,18 @@ def metadata_index(job: dict) -> dict[str, dict]:
         if parameters.is_file():
             try:
                 document = read_json(parameters)
+                declared = document.get("config", {}).get("sample", {})
+                defaults = evaluation_defaults()["sample"]
+                inference_settings = {key: declared.get(key, defaults[key]) for key in OPTIONAL_SAMPLING_FIELDS}
+                if isinstance(inference_settings["scheduler"], dict):
+                    inference_settings["scheduler"] = {**defaults["scheduler"], **inference_settings["scheduler"]}
                 for item in document.get("images", []):
                     if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                         continue
                     candidate = safe_path(item["path"], root=root)
-                    data = {**document.get("sample", {}), **item, "kind": "evaluation", "metadata_source": "parameters.json"}
+                    data = {**inference_settings, **document.get("sample", {}), **item, "kind": "evaluation", "metadata_source": "parameters.json"}
+                    if isinstance(document.get("model_paths"), dict):
+                        data["model_paths"] = document["model_paths"]
                     prompts = document.get("prompts", [])
                     index = item.get("prompt_index")
                     if type(index) is int and 0 <= index < len(prompts):
@@ -135,7 +143,15 @@ def sampling_snapshot(job: dict) -> dict:
     try:
         config = read_json(safe_path(job["config_path"]))
         sample = config.get("sample", {})
-        return sample if isinstance(sample, dict) else {}
+        if not isinstance(sample, dict):
+            return {}
+        defaults = evaluation_defaults()["sample"]
+        effective = dict(sample)
+        for key in OPTIONAL_SAMPLING_FIELDS:
+            effective.setdefault(key, defaults[key])
+        if isinstance(effective["scheduler"], dict):
+            effective["scheduler"] = {**defaults["scheduler"], **effective["scheduler"]}
+        return effective
     except (OSError, InputError, AttributeError):
         return {}
 

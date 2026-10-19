@@ -21,6 +21,7 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 from .data import cache_dataset
+from .launch import resolve_model_paths
 from .vendor.pipeline_moss_image import MOSSImageTransformer
 
 logger = logging.getLogger(__name__)
@@ -158,9 +159,9 @@ def training_kernels(config: dict, *, dit=None, network=None) -> Iterator[None]:
 
 def load_dit(config: dict, checkpointing: bool = False) -> MOSSImageTransformer:
     """Load the frozen BF16 DiT; the training caller explicitly selects train mode."""
-    group_size = resolve_checkpoint_group_size(config)
+    group_size = resolve_checkpoint_group_size(config) if checkpointing else 1
     dit = MOSSImageTransformer.from_pretrained(
-        Path(config["model_dir"]) / "transformer",
+        resolve_model_paths(config)["transformer"],
         torch_dtype=torch.bfloat16,
         local_files_only=True,
     )
@@ -174,7 +175,7 @@ def load_dit(config: dict, checkpointing: bool = False) -> MOSSImageTransformer:
 def load_vae(config: dict, device: str = "cuda") -> AutoencoderKLFlux2:
     """Keep the frozen Flux2 VAE in FP32 for both encoding and decoding."""
     vae = AutoencoderKLFlux2.from_pretrained(
-        Path(config["model_dir"]) / "vae",
+        resolve_model_paths(config)["vae"],
         torch_dtype=torch.float32,
         local_files_only=True,
     )
@@ -235,16 +236,16 @@ def create_adapter(dit: MOSSImageTransformer, config: dict):
 def encode_text(config: dict, captions: list[str]) -> Iterator[tuple[str, torch.Tensor]]:
     """Stream unpadded CPU embeddings, releasing the frozen TE on completion."""
     text_config = config["text"]
-    model_dir = Path(config["model_dir"])
+    model_paths = resolve_model_paths(config)
     tokenizer = None
     text_encoder = None
     started = time.perf_counter()
     logger.info("encoding %d texts with frozen text encoder", len(captions))
     try:
         load_started = time.perf_counter()
-        tokenizer = AutoTokenizer.from_pretrained(model_dir / "tokenizer", local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_paths["tokenizer"], local_files_only=True)
         text_encoder = AutoModel.from_pretrained(
-            model_dir / "text_encoder",
+            model_paths["text_encoder"],
             local_files_only=True,
             dtype=torch.bfloat16,
             device_map="auto",

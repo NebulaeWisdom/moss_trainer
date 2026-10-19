@@ -15,7 +15,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     __package__ = "moss_trainer"
 
-from .launch import configure_environment
+from .launch import configure_environment, resolve_model_paths
 
 
 def main() -> None:
@@ -84,8 +84,8 @@ def main() -> None:
     from tqdm import tqdm
 
     from .runtime import create_adapter, encode_text, load_dit, load_vae
-    from .sample import decode_latents, sample_latents
-    from .vendor.pipeline_moss_image import MOSSImagePipeline, MOSSImageScheduler
+    from .sample import create_sample_scheduler, decode_latents, sample_latents
+    from .vendor.pipeline_moss_image import MOSSImagePipeline
 
     phase_timings = {}
     load_counts = {"text_encoder": 0, "dit": 0, "vae": 0, "adapter_network": 0, "adapter_checkpoints": 0}
@@ -120,7 +120,7 @@ def main() -> None:
     load_counts["vae"] += 1
 
     phase_started = time.perf_counter()
-    pipe = MOSSImagePipeline(dit, MOSSImageScheduler(), vae=vae).to("cuda")
+    pipe = MOSSImagePipeline(dit, create_sample_scheduler(sample), vae=vae).to("cuda")
     pipe.set_progress_bar_config(disable=True)
     phase_timings["pipeline_setup_seconds"] = time.perf_counter() - phase_started
     phase_timings["adapter_load_seconds"] = 0.0
@@ -213,9 +213,11 @@ def main() -> None:
         del negative, negative_mask
 
     phase_timings["total_seconds"] = time.perf_counter() - started
+    model_dir = (config.get("model_dir") or "").strip()
     parameters = {
         "config_source": str(args.config.resolve()),
-        "model_dir": str(Path(config["model_dir"]).resolve()),
+        "model_dir": str(Path(model_dir).expanduser().resolve()) if model_dir else None,
+        "model_paths": {name: str(path) for name, path in resolve_model_paths(config).items()},
         "config": config,
         "inputs": {
             key: [str(item) if isinstance(item, Path) else item for item in value]
@@ -228,8 +230,14 @@ def main() -> None:
         "seeds": seeds,
         "multipliers": multipliers,
         "sample": {
-            key: sample[key]
-            for key in ("width", "height", "num_inference_steps", "guidance_scale")
+            **{
+                key: sample[key]
+                for key in ("width", "height", "num_inference_steps", "guidance_scale")
+            },
+            "scheduler": {
+                key: pipe.scheduler.config[key]
+                for key in ("num_train_timesteps", "shift", "training_shift")
+            },
         },
         "adapters": adapters,
         "adapter_modules": len(network.loras) if network is not None else 0,

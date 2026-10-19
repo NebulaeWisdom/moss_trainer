@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import artifacts
 from .config import (
     DEFAULT_OUTPUT_ROOT, MAX_JSON_BYTES, PROJECT_DIR, STATE_DIR, WORKSPACE_DIR,
-    ConfigStore, InputError, read_json, safe_path, schema,
+    ConfigStore, InputError, evaluation_defaults, read_json, safe_path, schema,
 )
 from .jobs import JobStore, checkpoint_config, public_job, python_path
 from .telemetry import SystemMonitor
@@ -150,6 +150,10 @@ def create_app() -> FastAPI:
     @app.get("/api/schema")
     def config_schema():
         return schema()
+
+    @app.get("/api/evaluation-defaults")
+    def get_evaluation_defaults():
+        return {"config": evaluation_defaults()}
 
     @app.get("/api/configs")
     def list_configs():

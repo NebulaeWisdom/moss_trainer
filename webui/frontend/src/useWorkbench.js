@@ -15,8 +15,8 @@ export function useWorkbench() {
   const config = ref(null)
   const configDraftToken = shallowRef({})
   const evaluationConfig = ref(null)
-  const evaluationDraftToken = shallowRef({})
-  const evaluationOrigin = ref('尚未初始化独立评估配置')
+  const evaluationDefaults = ref(null)
+  const evaluationOrigin = ref('独立推理草稿 · 正在读取默认参数')
   const evaluationBaseline = ref('')
   const evaluationLoading = ref(false)
   const checkpoints = ref([])
@@ -127,6 +127,34 @@ export function useWorkbench() {
     try { return await attempt('checkpoints', async () => { const result = await request('/checkpoints'); checkpoints.value = result.checkpoints; if (result.truncated) ElMessage.warning('检查点扫描窗口已截断；可显式添加未列出的工作区检查点路径。'); return result }) }
     finally { checkpointsLoading.value = false }
   }
+  function inferenceDraft(source = {}) {
+    const defaults = evaluationDefaults.value
+    const pick = (value, keys) => Object.fromEntries(keys.filter(key => value && Object.hasOwn(value, key)).map(key => [key, value[key]]))
+    return clone({
+      model_dir: Object.hasOwn(source, 'model_dir') ? source.model_dir : defaults.model_dir,
+      model_paths: { ...defaults.model_paths, ...pick(source.model_paths, ['transformer', 'vae', 'text_encoder', 'tokenizer']) },
+      text: { ...defaults.text, ...pick(source.text, ['max_sequence_length', 'gpu_memory_gib', 'cpu_memory_gib']) },
+      adapter: { ...defaults.adapter, ...pick(source.adapter, ['algo', 'rank', 'alpha', 'dropout', 'target_modules', 'kwargs']) },
+      sample: {
+        ...defaults.sample,
+        ...pick(source.sample, ['prompt', 'negative_prompt', 'width', 'height', 'num_inference_steps', 'guidance_scale', 'seed', 'uncond_skip_layers', 'slg_layers', 'slg_scale', 'slg_start', 'slg_stop']),
+        scheduler: { ...defaults.sample.scheduler, ...pick(source.sample?.scheduler, ['num_train_timesteps', 'shift', 'training_shift']) },
+      },
+    })
+  }
+  async function loadEvaluationDefaults() {
+    if (!evaluationDefaults.value) {
+      const result = await attempt('evaluationDefaults', () => request('/evaluation-defaults'))
+      if (!result) return false
+      evaluationDefaults.value = result.config
+    }
+    if (!evaluationConfig.value) {
+      evaluationConfig.value = inferenceDraft()
+      evaluationBaseline.value = JSON.stringify(evaluationConfig.value)
+      evaluationOrigin.value = '独立推理草稿 · 直接填写本页模型路径即可使用'
+    }
+    return true
+  }
   async function initialize() {
     initializing.value = true
     try {
@@ -136,6 +164,7 @@ export function useWorkbench() {
         refreshConfigs(),
         poll(),
         refreshCheckpoints(),
+        loadEvaluationDefaults(),
       ])
       if (!config.value && listing?.configs?.length) {
         const remembered = listing.configs.find(item => item.id === stored('selectedConfig'))
@@ -193,13 +222,18 @@ export function useWorkbench() {
   }
   function stageError(stage) {
     const draft = stage === 'evaluation' ? evaluationConfig.value : config.value
-    if (!draft) return stage === 'evaluation' ? '请先显式初始化独立评估配置。' : '请先加载配置。'
+    if (!draft) return stage === 'evaluation' ? '独立推理默认参数尚未读取，请刷新本地 API 连接。' : '请先加载配置。'
     if (activeJobs.value.length) return '已有活动 GPU 任务；完成或显式停止后再启动。'
     if (stage === 'train' && options.resume.trim()) return ''
-    if (typeof draft.model_dir !== 'string' || !draft.model_dir.trim()) return '请填写模型目录。'
+    if (stage !== 'evaluation' && (typeof draft.model_dir !== 'string' || !draft.model_dir.trim())) return '请填写模型目录。'
     if (stage === 'cache' && !draft.dataset?.image_dir) return '请填写 dataset.image_dir。'
     if (stage === 'train' && !options.cacheDir.trim()) return '请填写已完成的缓存目录。'
     if (stage === 'evaluation') {
+      const components = ['transformer', 'vae', 'text_encoder', 'tokenizer']
+      if ((!draft.model_dir || !draft.model_dir.trim()) && components.some(key => !draft.model_paths?.[key]?.trim())) return '请在本页填写基座模型根目录，或填写全部四个组件目录。'
+      if (!Number.isInteger(draft.text?.max_sequence_length) || draft.text.max_sequence_length <= 0 || !Number.isFinite(draft.text.gpu_memory_gib) || draft.text.gpu_memory_gib <= 0 || !Number.isFinite(draft.text.cpu_memory_gib) || draft.text.cpu_memory_gib <= 0) return '文本长度须为正整数，GPU / CPU 加载预算须为正数。'
+      const schedule = draft.sample?.scheduler
+      if (!Number.isInteger(schedule?.num_train_timesteps) || schedule.num_train_timesteps <= 0 || !Number.isFinite(schedule.shift) || schedule.shift <= 0 || !Number.isFinite(schedule.training_shift) || schedule.training_shift <= 0) return '调度器时间网格须为正整数，shift 与参考网格 shift 须为正数。'
       if (!evaluationOptions.includeBase && !evaluationOptions.adapters.length) return '请至少选择基座或一个 LoRA 检查点。'
       const sample = draft.sample
       const prompts = typeof sample?.prompt === 'string' ? [sample.prompt] : sample?.prompt
@@ -207,7 +241,9 @@ export function useWorkbench() {
       if (typeof sample.negative_prompt !== 'string') return '共享负向提示词必须为文本，可为空。'
       if (!Number.isInteger(sample.width) || sample.width <= 0 || sample.width % 16 || !Number.isInteger(sample.height) || sample.height <= 0 || sample.height % 16) return '宽高必须为正整数且为 16 的倍数。'
       if (!Number.isInteger(sample.num_inference_steps) || sample.num_inference_steps <= 0) return '采样步数必须为正整数。'
-      if (!Number.isFinite(sample.guidance_scale) || !Number.isInteger(sample.seed)) return '请填写有效的 CFG 与整数种子。'
+      if (!Number.isFinite(sample.guidance_scale) || sample.guidance_scale < 0 || !Number.isInteger(sample.seed)) return '请填写非负 CFG 与整数种子。'
+      if (['uncond_skip_layers', 'slg_layers'].some(key => !Array.isArray(sample[key]) || sample[key].some(value => !Number.isInteger(value) || value < 0))) return '跳层列表必须是非负整数数组；空列表表示不启用对应跳层。'
+      if (!Number.isFinite(sample.slg_scale) || sample.slg_scale < 0 || !Number.isFinite(sample.slg_start) || !Number.isFinite(sample.slg_stop) || sample.slg_start < 0 || sample.slg_stop > 1 || sample.slg_start > sample.slg_stop) return 'SLG 强度须非负；跳层作用区间须满足 0 ≤ start ≤ stop ≤ 1。'
     }
     return ''
   }
@@ -284,23 +320,23 @@ export function useWorkbench() {
   async function initializeEvaluation(job = null, checkpointPath = null) {
     if (evaluationLoading.value) return
     if (evaluationDirty.value) {
-      try { await ElMessageBox.confirm('初始化会替换当前独立评估草稿；训练配置和历史文件保持不变。继续？', '替换评估草稿', { confirmButtonText: '初始化独立草稿', cancelButtonText: '保留草稿', type: 'warning' }) }
+      try { await ElMessageBox.confirm('导入会替换当前独立推理草稿；仅提取模型、文本加载、适配器与采样设置。训练配置和历史文件保持不变。继续？', '导入推理参数', { confirmButtonText: '导入独立草稿', cancelButtonText: '保留草稿', type: 'warning' }) }
       catch { return }
     }
     evaluationLoading.value = true
     try {
+      if (!await loadEvaluationDefaults()) return
       let source = config.value
-      let origin = `训练表单的独立副本 · ${configurationName.value}`
+      let origin = `仅导入训练表单中的推理参数 · ${configurationName.value}`
       if (job || checkpointPath) {
         const result = await attempt('evaluationConfig', () => request(checkpointPath ? `/checkpoints/config?path=${encodeURIComponent(checkpointPath)}` : `/jobs/${encodeURIComponent(job.id)}/config`))
         if (!result) return
         source = result.config
-        origin = checkpointPath ? `检查点配置的独立副本 · ${checkpointPath}` : `训练任务快照 · ${job.name || job.id}`
+        origin = checkpointPath ? `仅导入检查点推理参数 · ${checkpointPath}` : `仅导入训练任务推理参数 · ${job.name || job.id}`
       }
       if (!source) { errors.evaluationConfig = '请先加载训练配置，或选择已完成训练任务。'; return }
-      evaluationConfig.value = clone(source)
-      evaluationDraftToken.value = {}
-      evaluationBaseline.value = JSON.stringify(source)
+      evaluationConfig.value = inferenceDraft(source)
+      evaluationBaseline.value = JSON.stringify(evaluationConfig.value)
       evaluationOrigin.value = origin
       if (job) {
         await refreshCheckpoints()
@@ -321,5 +357,5 @@ export function useWorkbench() {
   function onVisible() { if (!document.hidden) poll() }
   onMounted(() => { initialize(); timer = setInterval(poll, 2000); document.addEventListener('visibilitychange', onVisible); window.addEventListener('beforeunload', beforeUnload) })
   onBeforeUnmount(() => { disposed = true; clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); window.removeEventListener('beforeunload', beforeUnload) })
-  return { page, theme, info, schema, configs, configRecord, config, configDraftToken, evaluationConfig, evaluationDraftToken, evaluationOrigin, evaluationLoading, evaluationOptions, checkpoints, checkpointsLoading, jobConfig, jobs, selectedId, selectedJob, activeJobs, system, metrics, images, imagesTruncated, logs, logTrimmed, now, lastSuccess, initializing, loadingConfig, launching, stopping, saving, errors, errorList, saveDialog, revisionName, stopTarget, snapshot, snapshotDialog, snapshotLoading, options, dirty, newestMetric, configurationName, initialize, loadConfig, refreshConfigs, refreshCheckpoints, initializeEvaluation, poll, stageError, launch, confirmStop, saveRevision, viewSnapshot, loadSnapshot, useCache }
+  return { page, theme, info, schema, configs, configRecord, config, configDraftToken, evaluationConfig, evaluationOrigin, evaluationLoading, evaluationOptions, checkpoints, checkpointsLoading, jobConfig, jobs, selectedId, selectedJob, activeJobs, system, metrics, images, imagesTruncated, logs, logTrimmed, now, lastSuccess, initializing, loadingConfig, launching, stopping, saving, errors, errorList, saveDialog, revisionName, stopTarget, snapshot, snapshotDialog, snapshotLoading, options, dirty, newestMetric, configurationName, initialize, loadConfig, refreshConfigs, refreshCheckpoints, initializeEvaluation, poll, stageError, launch, confirmStop, saveRevision, viewSnapshot, loadSnapshot, useCache }
 }

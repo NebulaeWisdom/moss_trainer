@@ -17,10 +17,16 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 
+from .launch import resolve_model_paths
 from .runtime import create_adapter, encode_text, load_dit, load_vae
 from .vendor.pipeline_moss_image import MOSSImagePipeline, MOSSImageScheduler
 
 logger = logging.getLogger(__name__)
+
+
+def create_sample_scheduler(sample: dict) -> MOSSImageScheduler:
+    """Use the official nearest-grid Euler scheduler with optional config overrides."""
+    return MOSSImageScheduler(**sample.get("scheduler", {}))
 
 
 def decode_latents(vae, latents: torch.Tensor, image_processor, output_type: str = "pil"):
@@ -62,6 +68,11 @@ def sample_latents(
             guidance_scale=sample["guidance_scale"],
             generator=generator,
             output_type="latent",
+            **{
+                key: sample[key]
+                for key in ("uncond_skip_layers", "slg_layers", "slg_scale", "slg_start", "slg_stop")
+                if key in sample
+            },
         ).images
 
 
@@ -97,7 +108,7 @@ def generate_preview(
         # initializes weights and can consume the global torch RNG.
         with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
             vae = load_vae(config)
-            pipe = MOSSImagePipeline(dit, MOSSImageScheduler(), vae=vae).to("cuda")
+            pipe = MOSSImagePipeline(dit, create_sample_scheduler(sample), vae=vae).to("cuda")
             pipe.set_progress_bar_config(disable=True)
             negative = conditioning[sample["negative_prompt"]].unsqueeze(0).to(device="cuda", dtype=torch.bfloat16)
             negative_mask = torch.ones(negative.shape[:2], device="cuda", dtype=torch.bool)
@@ -166,6 +177,7 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = json.loads(args.config.read_text(encoding="utf-8"))
+    model_paths = {name: str(path) for name, path in resolve_model_paths(config).items()}
     sample = config["sample"]
     single_prompt = isinstance(sample["prompt"], str)
     prompts = [sample["prompt"]] if single_prompt else sample["prompt"]
@@ -185,7 +197,7 @@ def main() -> None:
     print(f"Loaded {len(weights)} tensors into {len(network.loras)} DiT adapter modules", flush=True)
     adapter_sha256 = hashlib.sha256(args.adapter.read_bytes()).hexdigest()
     vae = load_vae(config)
-    pipe = MOSSImagePipeline(dit, MOSSImageScheduler(), vae=vae).to("cuda")
+    pipe = MOSSImagePipeline(dit, create_sample_scheduler(sample), vae=vae).to("cuda")
 
     comparisons = []
     with torch.inference_mode():
@@ -219,12 +231,17 @@ def main() -> None:
 
             delta = np.abs(images["lora"] - images["base"])
             report = {
+                "model_paths": model_paths,
                 "adapter": str(args.adapter.resolve()),
                 "adapter_sha256": adapter_sha256,
                 "loaded_tensor_count": len(weights),
                 "adapter_modules": len(network.loras),
                 "sample": {
                     **{key: value for key, value in sample.items() if key not in ("prompt", "negative_prompt")},
+                    "scheduler": {
+                        key: pipe.scheduler.config[key]
+                        for key in ("num_train_timesteps", "shift", "training_shift")
+                    },
                     "prompt_chars": len(prompt),
                     "prompt_tokens": positive.shape[1],
                     "negative_prompt_chars": len(sample["negative_prompt"]),

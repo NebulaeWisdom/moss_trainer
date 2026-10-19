@@ -399,7 +399,7 @@ class JobStore:
                             cache = Path(start["cache_dir"])
                     except (ValueError, UnicodeError, AttributeError):
                         pass
-        validate_config(config, stage)
+        config = validate_config(config, stage)
         if stage == "train" and not resume:
             if not request.get("cache_dir"):
                 raise InputError("训练需要 cache_dir：先创建缓存，再填入缓存任务的实际目录。")

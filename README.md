@@ -46,7 +46,7 @@ python launch.py train --config configs/moss_official.json --cache-dir temp/my-c
 
 ## 独立采样 samples.py
 
-`launch.py sample` 之外的独立入口：一次加载模型，可对任意 prompt（不需要预先写进 cache）和多个 checkpoint 出图。`sample.prompt` 支持字符串或字符串列表；训练预览、`launch.py sample` 和 `samples.py` 都会为列表中的每条 prompt 分别出图。`--adapter` 可传多个文件；只采样基座时传 `--multiplier 0`，无需 adapter。非零 multiplier 必须提供 adapter。`--output-dir` 同样必须是新目录。
+`launch.py sample` 之外的独立入口：一次加载模型，可对任意 prompt（不需要预先写进 cache）和多个 checkpoint 出图。prompt 支持字符串或字符串列表（`sample.prompt` / `--prompts`），训练预览、`launch.py sample` 和本脚本都会逐条出图。`--adapter` 可传多个文件；只采样基座时传 `--multiplier 0`、无需 adapter，非零 multiplier 必须提供 adapter。`--output-dir` 同样必须是新目录。
 
 ```powershell
 python samples.py --config runs/my-run/config.json `
@@ -55,19 +55,11 @@ python samples.py --config runs/my-run/config.json `
   --output-dir temp/new-dir
 ```
 
-只评估基座、多 prompt：
-
-```powershell
-python samples.py --config configs/moss_official.json --multiplier 0 `
-  --prompts "an alpine lake at dawn" "a small observatory under the stars" `
-  --output-dir temp/base-evaluation
-```
-
 每张图的文件名包含 `prompt000` / `prompt001` 和 seed；`parameters.json` 保存完整 prompt、采样参数、来源与耗时。
 
 ## WebUI 工作台
 
-WebUI 是独立的本地进程，不会被 `launch.py` 或训练代码导入。训练仍可完全通过原有 CLI 使用；WebUI 启动失败不影响 CLI。关闭浏览器或 WebUI 服务**不会停止已启动的任务**；只有任务上的「停止」按钮会结束它管理的进程树。
+WebUI 是独立的本地进程，不会被 `launch.py` 或训练代码导入；启动失败不影响 CLI，关闭浏览器或服务也不会停止已启动的任务。功能覆盖配置读写、cache/train 启动、训练期预览矩阵、独立 XY 评估与指标/图库观察；一次只运行一个 GPU 任务，避免争抢显存。
 
 在 `moss_image_trainer/` 工作根使用项目 venv：
 
@@ -76,43 +68,7 @@ WebUI 是独立的本地进程，不会被 `launch.py` 或训练代码导入。�
 .\venv\Scripts\python.exe -m moss_trainer.webui --host 127.0.0.1 --port 7860
 ```
 
-浏览器访问 <http://127.0.0.1:7860>。前端资源随仓库提供，运行时不依赖 CDN，也不需要 Node.js。默认仅供本机使用，不提供账号认证，不应直接发布到公网。
-
-- **配置**：加载预设，通过分组表单编辑。字段只允许其合法类型；例如采样步数是整数，正向提示词允许文本或文本列表。提示词文本转列表会保留为首项；列表转文本显示首项，当前草稿中再次转列表仍保留其余项。保存时新建命名版本，不覆盖原文件；未保存的当前表单也可作为任务快照启动。
-- **训练流程**：只有缓存 → 训练两个环节；输出自动进入唯一子目录。训练期采样由配置 `sample.preview` 控制，是训练进程的一部分，不是第三种平级任务。
-- **训练预览**：训练任务详情按「固定探针 × 训练 Step」展示横向进化矩阵，并支持同一探针两个 Step 的 A/B 放大对比。探针按 prompt 编号及采样条件区分；不会把不同编号的图混作同一探针。缓存任务只展示日志和路径，不显示空图库。
-- **XY 评估**：侧栏有独立「评估」分组，与「训练」分组分开。评估页自行持有完整的推理草稿，可直接填写基座模型目录、组件覆盖路径、文本编码设置、采样调度器、提示词和输出目录，无需先打开训练 Configuration 或复制训练配置。Base 来源卡与多 LoRA 来源并列；一次加载模型运行全部组合，矩阵按 prompt / seed 分行、base / checkpoint 分列。评估改动不影响训练配置；多个 LoRA 必须匹配当前模型和适配器结构。
-- **训练后评估**：已完成训练可从检查点进入 XY 评估。事后补跑的图只进入新的评估输出目录，不冒充训练当时的预览，也不会写回原训练记录。
-- **观察**：显示 CPU、RAM、磁盘和 NVIDIA GPU/显存/温度/功耗；不支持的硬件指标显示不可用，不伪造读数。任务日志、训练 loss / 学习率 / 耗时曲线与数值表、进化矩阵和 XY 图均来自真实任务文件。
-- **进程与数据**：状态和日志保存在 `moss_trainer/.webui/`；服务重启后可继续观察原任务。一次只运行一个工作台 GPU 任务，避免缓存、训练和采样争抢显存。
-- **停止**：当前训练器没有优雅停止协议，停止会终止任务进程树；保留已写入的 checkpoint、日志和图片，未保存的训练进度不会自动补存。
-- **采样与恢复**：多 prompt 一项一条；加载 adapter 必须匹配 algo / rank / alpha 等设置。训练恢复只应选择可信的本地 `state.pt`，恢复参数以该状态文件中的配置为准。
-
-WebUI 不会自动修改性能设置。如果当前环境不支持 Triton / Inductor，请在训练表单中关闭 `compile_pointwise`；具体限制见下方「性能开关」。
-
-### 评估模型与采样设置
-
-评估页的基座根目录 `model_dir` 默认读取其 `transformer/`、`vae/`、`text_encoder/`、`tokenizer/` 子目录。可在同页设置 `model_paths` 中对应的组件目录；留空表示继承根目录。覆盖路径指向组件文件夹，不是单个 `.safetensors` 文件；仅从本地加载。四个组件均指定时可不填根目录。运行记录保存解析后的真实组件路径。
-
-文本最大长度、文本编码器 GPU / CPU 内存预算、适配器结构参数也在评估页编辑。采样算法仍为 MOSS 官方 V2 nearest-grid Euler；`sample.scheduler` 可调整 `num_train_timesteps`、`shift`、`training_shift`，默认分别为 `1000`、`5.0`、`1.0`，不提供未实现的算法选项。参考网格参数应与模型训练约定匹配。
-
-高级引导包含 `uncond_skip_layers`（默认 `[22]`）、`slg_layers`（默认空）、`slg_scale`（默认 `0`）、`slg_start` / `slg_stop`（默认 `0` / `1`）。空层列表可禁用跳层；SLG 强度必须非负，区间满足 `0 <= start <= stop <= 1`，层编号由实际模型校验。未填写新增选项时，原有 CLI 与训练预览保持原默认采样行为。
-
-评估页不展示 dataset、optimizer、训练学习率 scheduler、训练步数、保存频率和数据加载器参数：它们不参与独立采样。DiT / 文本编码器 BF16、VAE FP32 和离线加载仍是现有实现约定，不伪装成可切换选项。从训练表单或 checkpoint 导入只是一项可选便利功能，且只提取推理所需字段。
-
-### 运行范围与前端源码
-
-工作台只管理自己启动的任务，不会接管或停止另一个终端手工启动的 Python 进程。恢复已有 CLI 训练时，状态文件必须位于工作目录内，旁边保留该次训练的 `config.json`。指标展示最近 5,000 个 step（最多读取日志末尾 4 MiB），图库最多展示最近 500 张识别到的采样 PNG；原始文件不被裁剪或删除。
-
-前端源码位于 `webui/frontend/`（Vue 3、Element Plus、ECharts），后端位于 `webui/`（FastAPI、psutil、NVML）。仅修改前端源码时需要 Node.js：
-
-```powershell
-# 在 moss_trainer/webui/frontend/ 中执行
-npm install --cache ../../../temp/npm-cache
-npm run build
-```
-
-每次构建生成新的 `webui/static/<build-id>/`，不会清空旧版本。重启 WebUI 后会选择最新完整版本；已运行训练不受影响。任务日志、配置版本、旧构建和验收产物都不会自动清理。
+浏览器访问 <http://127.0.0.1:7860>。仅本机使用，不提供账号认证，不应发布到公网；任务上的「停止」会终止其进程树，未保存的训练进度不会补存。工作台只管理自己启动的任务，不接管外部 CLI 进程；前端源码在 `webui/frontend/`，仅修改前端时需要 Node.js。
 
 ## 配置预设
 
